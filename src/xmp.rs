@@ -213,7 +213,7 @@ fn ensure_packet(xmp: &str) -> String {
 pub fn write_gpano_jpeg(path: &Path, tags: &GPano) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
-        return Err("Tags can only be written into JPEG files".into());
+        return Err(tr!("Tags can only be written into JPEG files").into());
     }
     // Walk segments up to SOS.
     let mut pos = 2usize;
@@ -221,7 +221,7 @@ pub fn write_gpano_jpeg(path: &Path, tags: &GPano) -> Result<(), String> {
     let mut insert_at = 2usize;
     while pos + 4 <= data.len() {
         if data[pos] != 0xFF {
-            return Err("Corrupt JPEG header".into());
+            return Err(tr!("Corrupt JPEG header").into());
         }
         let marker = data[pos + 1];
         if marker == 0xDA || marker == 0xD9 {
@@ -230,7 +230,7 @@ pub fn write_gpano_jpeg(path: &Path, tags: &GPano) -> Result<(), String> {
         let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
         let end = pos + 2 + len;
         if end > data.len() {
-            return Err("Corrupt JPEG header".into());
+            return Err(tr!("Corrupt JPEG header").into());
         }
         let payload = &data[pos + 4..end];
         if marker == 0xE1 && payload.starts_with(XMP_SIG) {
@@ -252,7 +252,7 @@ pub fn write_gpano_jpeg(path: &Path, tags: &GPano) -> Result<(), String> {
     let mut seg = Vec::new();
     let body_len = 2 + XMP_SIG.len() + xmp.len();
     if body_len > 0xFFFF {
-        return Err("XMP packet too large for a single JPEG segment".into());
+        return Err(tr!("XMP packet too large for a single JPEG segment").into());
     }
     seg.extend_from_slice(&[0xFF, 0xE1]);
     seg.extend_from_slice(&(body_len as u16).to_be_bytes());

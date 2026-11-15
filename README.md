@@ -53,6 +53,9 @@ with adjustable speed).
 - Filtering: nearest, trilinear (mipmapped), bicubic, Lanczos3, chosen
   separately for a still view and while moving.
 - Recent files, settings in `~/.config/rustypano/settings.toml`.
+- English and German UI. The language follows the system (`LANGUAGE`,
+  `LC_ALL`, `LC_MESSAGES`, `LANG` on Linux) and can be changed under
+  Edit → Settings → View → Language.
 
 ## How rendering works
 
@@ -72,6 +75,22 @@ Some OpenGL drivers fail silently when video memory runs out; in that case the
 panorama is downscaled by 2 and uploaded again. There is also a configurable
 GPU memory budget (Settings → System).
 
+## Translations
+
+User-visible text is wrapped in `tr!("English text")`, or
+`tr!("Loaded {n} files", n = count)` when it has named placeholders. The English text
+is the lookup key. Catalogs live in `i18n/<lang>.toml` and map the English text to
+the translation:
+
+```toml
+"Open a panorama (Ctrl+O)" = "Panorama öffnen (Strg+O)"
+```
+
+`cargo test` fails if a `tr!` string has no German entry, if the catalog has entries
+the code no longer uses, or if a translation changes the `{placeholders}`. To add a
+language, add a variant to `Lang` and `LanguageChoice` in `src/i18n.rs` and a new
+catalog file.
+
 ## Layout
 
 | File | Purpose |
@@ -84,6 +103,7 @@ GPU memory budget (Settings → System).
 | `src/fsv.rs` | `.fsv` parser and GPano → view parameters |
 | `src/xmp.rs` | GPano XMP read (JPEG/TIFF/PNG) and write (JPEG) |
 | `src/settings.rs` | persisted preferences |
+| `src/i18n.rs`, `i18n/de.toml` | translations and language detection |
 
 Debug aids: `RUSTYPANO_SCREENSHOT=out.png` saves one rendered frame and quits;
 `RUSTYPANO_GRID=1`, `RUSTYPANO_INTERP=nearest|bilinear|bicubic|lanczos` and

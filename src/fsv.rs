@@ -68,7 +68,7 @@ fn parse_num(v: &str, what: &str, errors: &mut Vec<String>) -> Option<f64> {
     match v.replace(',', ".").parse::<f64>() {
         Ok(n) => Some(n),
         Err(_) => {
-            errors.push(format!("{what} is not a number: {v}"));
+            errors.push(tr!("{what} is not a number: {value}", what = what, value = v));
             None
         }
     }
@@ -100,7 +100,7 @@ impl PanoParams {
             let up = line.to_uppercase();
             if up == "BEGIN HOTSPOT" {
                 if cur.is_some() {
-                    return Err("Unclosed hotspot block: every BEGIN HOTSPOT needs an END HOTSPOT".into());
+                    return Err(tr!("Unclosed hotspot block: every BEGIN HOTSPOT needs an END HOTSPOT").into());
                 }
                 cur = Some(HotspotDef::default());
                 has_x = false;
@@ -110,15 +110,15 @@ impl PanoParams {
             if up == "END HOTSPOT" {
                 if let Some(h) = cur.take() {
                     if !has_x {
-                        errors.push("A hotspot has no X position".into());
+                        errors.push(tr!("A hotspot has no X position").into());
                     } else if !has_y {
-                        errors.push("A hotspot has no Y position".into());
+                        errors.push(tr!("A hotspot has no Y position").into());
                     } else if h.target.as_os_str().is_empty() {
-                        errors.push("A hotspot has no TARGET".into());
+                        errors.push(tr!("A hotspot has no TARGET").into());
                     } else if !(0.0..=100.0).contains(&h.x) {
-                        errors.push("Hotspot X must lie between 0 and 100".into());
+                        errors.push(tr!("Hotspot X must lie between 0 and 100").into());
                     } else if !(0.0..=100.0).contains(&h.y) {
-                        errors.push("Hotspot Y must lie between 0 and 100".into());
+                        errors.push(tr!("Hotspot Y must lie between 0 and 100").into());
                     } else {
                         p.hotspots.push(h);
                     }
@@ -127,12 +127,12 @@ impl PanoParams {
             }
             if let Some(h) = cur.as_mut() {
                 if let Some(v) = strip_key(line, &up, "X=") {
-                    if let Some(n) = parse_num(v, "Hotspot X", &mut errors) {
+                    if let Some(n) = parse_num(v, tr!("Hotspot X"), &mut errors) {
                         h.x = n;
                         has_x = true;
                     }
                 } else if let Some(v) = strip_key(line, &up, "Y=") {
-                    if let Some(n) = parse_num(v, "Hotspot Y", &mut errors) {
+                    if let Some(n) = parse_num(v, tr!("Hotspot Y"), &mut errors) {
                         h.y = n;
                         has_y = true;
                     }
@@ -141,11 +141,11 @@ impl PanoParams {
                 } else if let Some(v) = strip_key(line, &up, "TARGET=") {
                     h.target = resolve(&base, v);
                 } else if let Some(v) = strip_key(line, &up, "INITIALYAW=") {
-                    h.initial_yaw = parse_num(v, "Hotspot INITIALYAW", &mut errors);
+                    h.initial_yaw = parse_num(v, tr!("Hotspot INITIALYAW"), &mut errors);
                 } else if let Some(v) = strip_key(line, &up, "INITIALPITCH=") {
-                    h.initial_pitch = parse_num(v, "Hotspot INITIALPITCH", &mut errors);
+                    h.initial_pitch = parse_num(v, tr!("Hotspot INITIALPITCH"), &mut errors);
                 } else if let Some(v) = strip_key(line, &up, "INITIALHFOV=") {
-                    h.initial_hfov = parse_num(v, "Hotspot INITIALHFOV", &mut errors);
+                    h.initial_hfov = parse_num(v, tr!("Hotspot INITIALHFOV"), &mut errors);
                 }
                 continue;
             }
@@ -174,7 +174,7 @@ impl PanoParams {
             }
         }
         if cur.is_some() {
-            return Err("Unclosed hotspot block: every BEGIN HOTSPOT needs an END HOTSPOT".into());
+            return Err(tr!("Unclosed hotspot block: every BEGIN HOTSPOT needs an END HOTSPOT").into());
         }
         p.check(&mut errors);
         if errors.is_empty() { Ok(p) } else { Err(errors.join("\n")) }
@@ -182,39 +182,39 @@ impl PanoParams {
 
     fn check(&self, errors: &mut Vec<String>) {
         if self.image.as_os_str().is_empty() {
-            errors.push("IMAGENAME is not set".into());
+            errors.push(tr!("IMAGENAME is not set").into());
         }
         if let Some(h) = self.horizon_position
             && !(0.0..=100.0).contains(&h) {
-                errors.push("HORIZONPOSITION must lie between 0 and 100".into());
+                errors.push(tr!("HORIZONPOSITION must lie between 0 and 100").into());
             }
         let yaw_ok = |v: Option<f64>| v.is_none_or(|v| (0.0..=360.0).contains(&v));
         let pitch_ok = |v: Option<f64>| v.is_none_or(|v| (-90.0..=90.0).contains(&v));
         if !yaw_ok(self.yaw) {
-            errors.push("YAW must lie between 0 and 360".into());
+            errors.push(tr!("YAW must lie between 0 and 360").into());
         }
         if !pitch_ok(self.pitch) {
-            errors.push("PITCH must lie between -90 and 90".into());
+            errors.push(tr!("PITCH must lie between -90 and 90").into());
         }
         if !yaw_ok(self.min_yaw) {
-            errors.push("MINYAW must lie between 0 and 360".into());
+            errors.push(tr!("MINYAW must lie between 0 and 360").into());
         }
         if !yaw_ok(self.max_yaw) {
-            errors.push("MAXYAW must lie between 0 and 360".into());
+            errors.push(tr!("MAXYAW must lie between 0 and 360").into());
         }
         if let (Some(a), Some(b)) = (self.min_yaw, self.max_yaw)
             && b <= a {
-                errors.push("MAXYAW has to exceed MINYAW".into());
+                errors.push(tr!("MAXYAW has to exceed MINYAW").into());
             }
         if !pitch_ok(self.min_pitch) {
-            errors.push("MINPITCH must lie between -90 and 90".into());
+            errors.push(tr!("MINPITCH must lie between -90 and 90").into());
         }
         if !pitch_ok(self.max_pitch) {
-            errors.push("MAXPITCH must lie between -90 and 90".into());
+            errors.push(tr!("MAXPITCH must lie between -90 and 90").into());
         }
         if let (Some(a), Some(b)) = (self.min_pitch, self.max_pitch)
             && b <= a {
-                errors.push("MAXPITCH has to exceed MINPITCH".into());
+                errors.push(tr!("MAXPITCH has to exceed MINPITCH").into());
             }
     }
 

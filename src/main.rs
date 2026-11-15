@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 RustyPano contributors
 
+#[macro_use]
+mod i18n;
+
 mod app;
 mod fsv;
 mod loader;
@@ -14,18 +17,19 @@ use std::sync::Arc;
 
 use eframe::{egui, egui_wgpu, wgpu};
 
-const USAGE: &str = "\
-Usage: rustypano [options] [file.jpg|file.tif|file.fsv]
+fn usage() -> &'static str {
+    tr!("Usage: rustypano [options] [panorama image | tour.fsv]
 
 Options:
   -y <yaw>        initial yaw (0..360)
   -p <pitch>      initial pitch (-90..90)
   -hf <hfov>      initial horizontal field of view
-  -fs             start at full screen
+  -fs             start in fullscreen
   -hson           show hotspots
   -left <x> -top <y> -width <w> -height <h>
                   window position and size (all four required)
-  -h, --help      show this help";
+  -h, --help      show this help")
+}
 
 struct Parsed {
     cli: app::CliOptions,
@@ -43,8 +47,8 @@ fn parse_args() -> Result<Parsed, String> {
         };
         let key = key.trim_start_matches('-').to_lowercase();
         let mut value = |name: &str| -> Result<f64, String> {
-            let v = inline.clone().or_else(|| args.next()).ok_or(format!("{name} needs a value"))?;
-            v.parse::<f64>().map_err(|_| format!("{name} expects a number"))
+            let v = inline.clone().or_else(|| args.next()).ok_or(tr!("{name} needs a value", name = name))?;
+            v.parse::<f64>().map_err(|_| tr!("{name} expects a number", name = name))
         };
         if !a.starts_with('-') || a == "-" {
             cli.file = Some(PathBuf::from(&a));
@@ -54,21 +58,21 @@ fn parse_args() -> Result<Parsed, String> {
             "y" | "yaw" => {
                 let v = value("-y")?;
                 if !(0.0..=360.0).contains(&v) {
-                    return Err("-y expects a yaw between 0 and 360".into());
+                    return Err(tr!("-y expects a yaw between 0 and 360").into());
                 }
                 cli.yaw = Some(v);
             }
             "p" | "pitch" => {
                 let v = value("-p")?;
                 if !(-90.0..=90.0).contains(&v) {
-                    return Err("-p expects a pitch between -90 and 90".into());
+                    return Err(tr!("-p expects a pitch between -90 and 90").into());
                 }
                 cli.pitch = Some(v);
             }
             "hf" | "hfov" => {
                 let v = value("-hf")?;
                 if !(0.1..=view::MAX_HFOV).contains(&v) {
-                    return Err(format!("-hf expects a field of view between 0.1 and {}", view::MAX_HFOV));
+                    return Err(tr!("-hf expects a field of view between 0.1 and {max}", max = view::MAX_HFOV));
                 }
                 cli.hfov = Some(v);
             }
@@ -79,26 +83,28 @@ fn parse_args() -> Result<Parsed, String> {
             "width" => geo[2] = Some(value("-width")? as f32),
             "height" => geo[3] = Some(value("-height")? as f32),
             "h" | "help" => {
-                println!("{USAGE}");
+                println!("{}", usage());
                 std::process::exit(0);
             }
-            _ => return Err(format!("Unknown option {a}\n\n{USAGE}")),
+            _ => return Err(format!("{}\n\n{}", tr!("Unknown option {option}", option = a), usage())),
         }
     }
     let geometry = match geo {
         [Some(l), Some(t), Some(w), Some(h)] => Some([l, t, w, h]),
         [None, None, None, None] => None,
-        _ => return Err("Window geometry needs -left, -top, -width and -height together".into()),
+        _ => return Err(tr!("Window geometry needs -left, -top, -width and -height together").into()),
     };
     if let Some(f) = &cli.file
         && !f.exists() {
-            return Err(format!("No such file: {}", f.display()));
+            return Err(tr!("No such file: {path}", path = f.display()));
         }
     Ok(Parsed { cli, geometry })
 }
 
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,rustypano=info")).init();
+    let settings = settings::Settings::load();
+    i18n::apply(settings.language);
     let parsed = match parse_args() {
         Ok(p) => p,
         Err(e) => {
@@ -106,7 +112,6 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
     };
-    let settings = settings::Settings::load();
 
     let icon = image::load_from_memory(include_bytes!("../assets/icon256.png")).ok().map(|i| {
         let i = i.into_rgba8();

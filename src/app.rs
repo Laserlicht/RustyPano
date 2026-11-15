@@ -13,6 +13,7 @@ use eframe::egui::{
 use eframe::{egui_wgpu, wgpu};
 
 use crate::fsv::HotspotDef;
+use crate::i18n::{self, LanguageChoice};
 use crate::loader::{self, LoadJob, LoadedPano, Overrides};
 use crate::render::{PanoCallback, PanoRenderer, Uniforms};
 use crate::settings::{Interpolator, MonitorProfile, PanningMode, Settings};
@@ -191,10 +192,10 @@ impl RustyPanoApp {
 
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let mut d = rfd::FileDialog::new()
-            .set_title("Choose a panorama")
-            .add_filter("Panoramas", &[loader::IMAGE_EXTENSIONS, &["fsv"]].concat())
-            .add_filter("Panorama tour files", &["fsv"])
-            .add_filter("All files", &["*"]);
+            .set_title(tr!("Choose a panorama"))
+            .add_filter(tr!("Panoramas"), &[loader::IMAGE_EXTENSIONS, &["fsv"]].concat())
+            .add_filter(tr!("Panorama tour files"), &["fsv"])
+            .add_filter(tr!("All files"), &["*"]);
         if let Some(dir) = self.current_dir() {
             d = d.set_directory(dir);
         }
@@ -232,7 +233,7 @@ impl RustyPanoApp {
         let res = match job.rx.try_recv() {
             Ok(r) => r,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
-            Err(_) => Err("Loader thread crashed".into()),
+            Err(_) => Err(tr!("Loader thread crashed").into()),
         };
         let job = self.job.take().unwrap();
         match res {
@@ -240,7 +241,7 @@ impl RustyPanoApp {
             Err(e) if e == "cancelled" => {}
             Err(e) => {
                 self.message = Some(Message {
-                    title: "Could not open".into(),
+                    title: tr!("Could not open").into(),
                     text: format!("{}\n\n{e}", job.path.display()),
                 })
             }
@@ -447,9 +448,9 @@ impl RustyPanoApp {
         if self.pano.is_none() {
             painter.rect_filled(rect, 0.0, Color32::from_gray(24));
             let msg = if self.job.is_some() {
-                "Loading…"
+                tr!("Loading…")
             } else {
-                "Open a panorama with Ctrl+O, or drop an image or .fsv file here"
+                tr!("Open a panorama with Ctrl+O, or drop an image or .fsv file here")
             };
             painter.text(rect.center(), Align2::CENTER_CENTER, msg, egui::FontId::proportional(18.0), Color32::GRAY);
             if response.double_clicked() && self.job.is_none() {
@@ -500,15 +501,16 @@ impl RustyPanoApp {
                     let hp = (row / pano.view.geo.height * 100.0).round();
                     self.horizon_tool = false;
                     self.message = Some(Message {
-                        title: "Horizon Finder".into(),
+                        title: tr!("Horizon Finder").into(),
                         text: if (0.0..=100.0).contains(&hp) {
-                            format!(
+                            tr!(
                                 "Horizon detected at {hp}% of the image height.\n\n\
                                  Use HORIZONPOSITION={hp} in a .fsv file, or save it into the image \
-                                 via Tools → Photo Sphere Tags."
+                                 via Tools → Photo Sphere Tags.",
+                                hp = hp
                             )
                         } else {
-                            "The clicked point is outside the image.".into()
+                            tr!("The clicked point is outside the image.").into()
                         },
                     });
                 }
@@ -575,11 +577,13 @@ impl RustyPanoApp {
                 let secs = st.t0.elapsed().as_secs_f64();
                 let fps = st.frames as f64 / secs;
                 self.message = Some(Message {
-                    title: "Benchmark".into(),
-                    text: format!(
-                        "{fps:.1} fps\n({} frames rendered in {secs:.2} s{})",
-                        st.frames,
-                        if settings.vsync { ", limited by vsync" } else { "" }
+                    title: tr!("Benchmark").into(),
+                    text: tr!(
+                        "{fps} fps\n({frames} frames rendered in {secs} s{note})",
+                        fps = format!("{fps:.1}"),
+                        frames = st.frames,
+                        secs = format!("{secs:.2}"),
+                        note = if settings.vsync { tr!(", limited by vsync") } else { "" }
                     ),
                 });
                 self.speed_test = None;
@@ -699,7 +703,7 @@ impl RustyPanoApp {
         }
 
         if self.horizon_tool {
-            let t = "Click on the horizon (Esc to cancel)";
+            let t = tr!("Click on the horizon (Esc to cancel)");
             let pos = rect.center_top() + Vec2::new(0.0, 24.0);
             let galley = painter.layout_no_wrap(t.into(), egui::FontId::proportional(16.0), Color32::WHITE);
             let r = Rect::from_center_size(pos, galley.size()).expand(8.0);
@@ -737,13 +741,13 @@ impl RustyPanoApp {
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() {
+            ui.menu_button(tr!("File"), |ui| {
+                if ui.add(egui::Button::new(tr!("Open…")).shortcut_text(tr!("Ctrl+O"))).clicked() {
                     self.open_dialog(&ctx);
                 }
-                ui.menu_button("Recent Files", |ui| {
+                ui.menu_button(tr!("Recent Files"), |ui| {
                     if self.settings.mru.is_empty() {
-                        ui.label("(none)");
+                        ui.label(tr!("(none)"));
                     }
                     let mut chosen = None;
                     for (i, p) in self.settings.mru.iter().enumerate() {
@@ -758,84 +762,86 @@ impl RustyPanoApp {
                         } else {
                             self.settings.mru.retain(|m| m != &p);
                             self.message =
-                                Some(Message { title: "Recent Files".into(), text: "The file could not be found. It may have been moved or deleted.".into() });
+                                Some(Message { title: tr!("Recent Files").into(), text: tr!("The file could not be found. It may have been moved or deleted.").into() });
                         }
                     }
                 });
                 ui.separator();
-                if ui.add(egui::Button::new("Exit").shortcut_text("Ctrl+Q")).clicked() {
+                if ui.add(egui::Button::new(tr!("Exit")).shortcut_text(tr!("Ctrl+Q"))).clicked() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
-            ui.menu_button("Edit", |ui| {
-                if ui.button("Settings…").clicked() {
+            ui.menu_button(tr!("Edit"), |ui| {
+                if ui.button(tr!("Settings…")).clicked() {
                     self.options = Some(self.settings.clone());
                 }
             });
-            ui.menu_button("View", |ui| {
-                ui.checkbox(&mut self.settings.show_toolbar, "Button Bar");
-                ui.checkbox(&mut self.settings.show_status_bar, "Info Bar");
-                if ui.add(egui::Button::new("Fullscreen").shortcut_text("F11")).clicked() {
+            ui.menu_button(tr!("View"), |ui| {
+                ui.checkbox(&mut self.settings.show_toolbar, tr!("Button Bar"));
+                ui.checkbox(&mut self.settings.show_status_bar, tr!("Info Bar"));
+                if ui.add(egui::Button::new(tr!("Fullscreen")).shortcut_text("F11")).clicked() {
                     self.set_fullscreen(&ctx, !self.fullscreen);
                 }
                 ui.separator();
                 let has = self.pano.is_some();
                 let has_hs = self.pano.as_ref().is_some_and(|p| !p.hotspots.is_empty());
                 ui.add_enabled_ui(has_hs, |ui| {
-                    if ui.add(egui::Button::new("Hotspot Markers").selected(self.show_hotspots).shortcut_text("H")).clicked() {
+                    if ui.add(egui::Button::new(tr!("Hotspot Markers")).selected(self.show_hotspots).shortcut_text("H")).clicked() {
                         self.show_hotspots = !self.show_hotspots;
                     }
-                    if ui.button("Jump to Hotspot…").clicked() {
+                    if ui.button(tr!("Jump to Hotspot…")).clicked() {
                         self.hotspot_list = Some(None);
                     }
                 });
                 ui.add_enabled_ui(has, |ui| {
-                    if ui.add(egui::Button::new("Grid Overlay").selected(self.show_grid).shortcut_text("G")).clicked() {
+                    if ui.add(egui::Button::new(tr!("Grid Overlay")).selected(self.show_grid).shortcut_text("G")).clicked() {
                         self.show_grid = !self.show_grid;
                     }
-                    if ui.add(egui::Button::new("Reset View").shortcut_text("Home")).clicked() {
+                    if ui.add(egui::Button::new(tr!("Reset View")).shortcut_text(tr!("Home"))).clicked() {
                         self.reset_view();
                     }
                 });
                 ui.separator();
                 let prev = self.folder_neighbour(-1);
                 let next = self.folder_neighbour(1);
-                if ui.add_enabled(prev.is_some(), egui::Button::new("Previous in Folder").shortcut_text("Alt+Left")).clicked() {
+                if ui.add_enabled(prev.is_some(), egui::Button::new(tr!("Previous in Folder")).shortcut_text(tr!("Alt+Left"))).clicked() {
                     self.open(&ctx, prev.unwrap(), None);
                 }
-                if ui.add_enabled(next.is_some(), egui::Button::new("Next in Folder").shortcut_text("Alt+Right")).clicked() {
+                if ui.add_enabled(next.is_some(), egui::Button::new(tr!("Next in Folder")).shortcut_text(tr!("Alt+Right"))).clicked() {
                     self.open(&ctx, next.unwrap(), None);
                 }
             });
-            ui.menu_button("Tools", |ui| {
+            ui.menu_button(tr!("Tools"), |ui| {
                 let has = self.pano.is_some();
                 ui.add_enabled_ui(has, |ui| {
-                    if ui.button("Go to View…").clicked() {
+                    if ui.button(tr!("Go to View…")).clicked() {
                         let v = &self.pano.as_ref().unwrap().view;
                         self.view_params =
                             Some(ViewParamsDraft { yaw: v.yaw, pitch: v.pitch, hfov: v.hfov, confirm_default: false });
                     }
-                    if ui.button("Photo Sphere Tags…").clicked() {
+                    if ui.button(tr!("Photo Sphere Tags…")).clicked() {
                         self.open_metadata();
                     }
-                    if ui.button("Find Horizon…").clicked() {
+                    if ui.button(tr!("Find Horizon…")).clicked() {
                         self.message = Some(Message {
-                            title: "Horizon Finder".into(),
-                            text: "Click the horizon in the panorama to measure where it lies in the \
-                                   image.\n\nThe result is displayed only; nothing gets saved. \
-                                   Press Esc to cancel."
-                                .into(),
+                            title: tr!("Horizon Finder").into(),
+                            text: tr!(
+                                "Click the horizon in the panorama to measure where it lies in the \
+                                 image.\n\nThe result is displayed only; nothing gets saved. \
+                                 Press Esc to cancel."
+                            )
+                            .into(),
                         });
                         self.horizon_tool = true;
                     }
-                    if ui.button("Benchmark").clicked() {
+                    if ui.button(tr!("Benchmark")).clicked() {
                         self.speed_test = Some(SpeedTest { t0: Instant::now(), frames: 0, turned: 0.0 });
                         ctx.request_repaint();
                     }
                 });
             });
-            ui.menu_button("Help", |ui| {
-                if ui.button("About RustyPano…").clicked() {
+            ui.menu_button(tr!("Help"), |ui| {
+                if ui.button(tr!("About RustyPano…")).clicked() {
                     self.about = true;
                 }
             });
@@ -845,33 +851,33 @@ impl RustyPanoApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
-            if ui.button("Open").on_hover_text("Open a panorama (Ctrl+O)").clicked() {
+            if ui.button(tr!("Open")).on_hover_text(tr!("Open a panorama (Ctrl+O)")).clicked() {
                 self.open_dialog(&ctx);
             }
             let prev = self.folder_neighbour(-1);
             let next = self.folder_neighbour(1);
-            if ui.add_enabled(prev.is_some(), egui::Button::new("< Prev")).on_hover_text("Previous in folder (Alt+Left)").clicked() {
+            if ui.add_enabled(prev.is_some(), egui::Button::new(tr!("< Prev"))).on_hover_text(tr!("Previous in folder (Alt+Left)")).clicked() {
                 self.open(&ctx, prev.unwrap(), None);
             }
-            if ui.add_enabled(next.is_some(), egui::Button::new("Next >")).on_hover_text("Next in folder (Alt+Right)").clicked() {
+            if ui.add_enabled(next.is_some(), egui::Button::new(tr!("Next >"))).on_hover_text(tr!("Next in folder (Alt+Right)")).clicked() {
                 self.open(&ctx, next.unwrap(), None);
             }
             ui.separator();
-            if ui.button("Fullscreen").on_hover_text("Fullscreen (F11)").clicked() {
+            if ui.button(tr!("Fullscreen")).on_hover_text(tr!("Fullscreen (F11)")).clicked() {
                 self.set_fullscreen(&ctx, true);
             }
             let has_hs = self.pano.as_ref().is_some_and(|p| !p.hotspots.is_empty());
             ui.add_enabled_ui(has_hs, |ui| {
-                ui.toggle_value(&mut self.show_hotspots, "Hotspots").on_hover_text("Hotspot markers (H)");
+                ui.toggle_value(&mut self.show_hotspots, tr!("Hotspots")).on_hover_text(tr!("Hotspot markers (H)"));
             });
             ui.add_enabled_ui(self.pano.is_some(), |ui| {
-                ui.toggle_value(&mut self.show_grid, "Grid").on_hover_text("Grid overlay (G)");
+                ui.toggle_value(&mut self.show_grid, tr!("Grid")).on_hover_text(tr!("Grid overlay (G)"));
                 ui.separator();
-                if ui.button(" + ").on_hover_text("Zoom in (A / Shift / wheel)").clicked()
+                if ui.button(" + ").on_hover_text(tr!("Zoom in (A / Shift / wheel)")).clicked()
                     && let Some(p) = &mut self.pano {
                         p.view.zoom(1.0 / 1.25);
                     }
-                if ui.button(" - ").on_hover_text("Zoom out (Z / Ctrl / wheel)").clicked()
+                if ui.button(" - ").on_hover_text(tr!("Zoom out (Z / Ctrl / wheel)")).clicked()
                     && let Some(p) = &mut self.pano {
                         p.view.zoom(1.25);
                     }
@@ -892,11 +898,11 @@ impl RustyPanoApp {
             } else if let (Some(i), Some(p)) = (self.hovered_hotspot, &self.pano) {
                 let d = &p.hotspots[i].def;
                 let t = if d.description.is_empty() { d.target.display().to_string() } else { d.description.clone() };
-                ui.label(format!("Hotspot: {t}"));
+                ui.label(tr!("Hotspot: {t}", t = t));
             } else if let Some(p) = &self.pano {
                 ui.label(p.file_name());
             } else {
-                ui.label("Ready");
+                ui.label(tr!("Ready"));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if let Some(p) = &self.pano {
@@ -943,7 +949,7 @@ impl RustyPanoApp {
                 ui.add_space(6.0);
                 ui.label(&m.text);
                 ui.add_space(8.0);
-                if ui.button("  OK  ").clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
+                if ui.button(tr!("OK")).clicked() || ui.input(|i| i.key_pressed(Key::Enter)) {
                     close = true;
                 }
             });
@@ -957,31 +963,31 @@ impl RustyPanoApp {
         self.hotspots_dialog(ctx);
         if self.about {
             let mut open = true;
-            egui::Window::new("About RustyPano")
+            egui::Window::new(tr!("About RustyPano"))
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.heading(format!("RustyPano {}", env!("CARGO_PKG_VERSION")));
-                    ui.label("A GPU-accelerated viewer for equirectangular panoramas.");
-                    ui.label("Built with wgpu, winit and egui.");
+                    ui.label(tr!("A GPU-accelerated viewer for equirectangular panoramas."));
+                    ui.label(tr!("Built with wgpu, winit and egui."));
                     ui.add_space(6.0);
                     if let Some(p) = &self.pano {
                         let l = &p.loaded;
-                        ui.label(format!(
-                            "Current image: {}×{} px, {} GPU tile(s) of {} px, loaded in {:.2} s",
-                            l.width,
-                            l.height,
-                            l.gpu.tiles_x * l.gpu.tiles_y,
-                            l.gpu.tile_size,
-                            l.load_time
+                        ui.label(tr!(
+                            "Current image: {w}×{h} px, {tiles} GPU tile(s) of {size} px, loaded in {secs} s",
+                            w = l.width,
+                            h = l.height,
+                            tiles = l.gpu.tiles_x * l.gpu.tiles_y,
+                            size = l.gpu.tile_size,
+                            secs = format!("{:.2}", l.load_time)
                         ));
                         if let Some(icc) = &l.icc_used {
-                            ui.label(format!("Colour management: {icc}"));
+                            ui.label(tr!("Colour management: {icc}", icc = icc));
                         }
                     }
-                    ui.label(format!("Render: {:.0} fps", self.fps));
+                    ui.label(tr!("Render: {fps} fps", fps = format!("{:.0}", self.fps)));
                 });
             self.about = open;
         }
@@ -991,13 +997,13 @@ impl RustyPanoApp {
         let Some(draft) = &mut self.options else { return };
         let mut action = 0; // 1 = ok, 2 = cancel
         let mut error = None;
-        egui::Window::new("Settings")
+        egui::Window::new(tr!("Settings"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (i, t) in ["View", "Mouse", "Quality", "Colour", "Grid", "System"].iter().enumerate() {
+                    for (i, t) in [tr!("View"), tr!("Mouse"), tr!("Quality"), tr!("Colour"), tr!("Grid"), tr!("System")].iter().enumerate() {
                         ui.selectable_value(&mut self.options_tab, i, *t);
                     }
                 });
@@ -1006,27 +1012,40 @@ impl RustyPanoApp {
                 match self.options_tab {
                     0 => {
                         egui::Grid::new("gen").num_columns(2).show(ui, |ui| {
-                            ui.label("Start yaw");
+                            ui.label(tr!("Language"));
+                            let name = |c: LanguageChoice| match c {
+                                LanguageChoice::Auto => {
+                                    tr!("Automatic ({language})", language = i18n::detect().native_name())
+                                }
+                                other => other.resolve().native_name().to_string(),
+                            };
+                            egui::ComboBox::from_id_salt("language").selected_text(name(draft.language)).show_ui(ui, |ui| {
+                                for c in LanguageChoice::ALL {
+                                    ui.selectable_value(&mut draft.language, c, name(c));
+                                }
+                            });
+                            ui.end_row();
+                            ui.label(tr!("Start yaw"));
                             ui.add(egui::DragValue::new(&mut draft.default_yaw).range(0.0..=360.0).speed(0.5));
                             ui.end_row();
-                            ui.label("Start pitch");
+                            ui.label(tr!("Start pitch"));
                             ui.add(egui::DragValue::new(&mut draft.default_pitch).range(-90.0..=90.0).speed(0.5));
                             ui.end_row();
-                            ui.label("Start field of view");
+                            ui.label(tr!("Start field of view"));
                             ui.add(egui::DragValue::new(&mut draft.default_hfov).range(1.0..=MAX_HFOV).speed(0.5));
                             ui.end_row();
                         });
-                        ui.checkbox(&mut draft.show_yaw_pitch_in_status_bar, "Display view angles in the info bar");
-                        ui.checkbox(&mut draft.show_hotspot_tooltips, "Describe hotspots on hover");
+                        ui.checkbox(&mut draft.show_yaw_pitch_in_status_bar, tr!("Display view angles in the info bar"));
+                        ui.checkbox(&mut draft.show_hotspot_tooltips, tr!("Describe hotspots on hover"));
                     }
                     1 => {
-                        ui.label("Mouse behaviour");
-                        ui.radio_value(&mut draft.panning_mode, PanningMode::ClickAndDrag, "Grab: the image follows the pointer");
-                        ui.radio_value(&mut draft.panning_mode, PanningMode::AutoPanning, "Joystick: speed grows with distance from the click");
+                        ui.label(tr!("Mouse behaviour"));
+                        ui.radio_value(&mut draft.panning_mode, PanningMode::ClickAndDrag, tr!("Grab: the image follows the pointer"));
+                        ui.radio_value(&mut draft.panning_mode, PanningMode::AutoPanning, tr!("Joystick: speed grows with distance from the click"));
                         ui.add_space(6.0);
                         ui.add_enabled_ui(draft.panning_mode == PanningMode::AutoPanning, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label("Joystick speed:");
+                                ui.label(tr!("Joystick speed:"));
                                 ui.add(egui::Slider::new(&mut draft.mouse_sensitivity, 1.0..=10.0).step_by(0.5));
                             });
                         });
@@ -1040,30 +1059,30 @@ impl RustyPanoApp {
                             });
                         };
                         egui::Grid::new("interp").num_columns(2).show(ui, |ui| {
-                            ui.label("When still");
+                            ui.label(tr!("When still"));
                             combo(ui, "steady", &mut draft.interpolator_steady);
                             ui.end_row();
-                            ui.label("While moving");
+                            ui.label(tr!("While moving"));
                             combo(ui, "panning", &mut draft.interpolator_panning);
                             ui.end_row();
                         });
-                        ui.label(RichText::new("All interpolators run on the GPU with mipmapping.").weak());
+                        ui.label(RichText::new(tr!("All interpolators run on the GPU with mipmapping.")).weak());
                     }
                     3 => {
-                        ui.checkbox(&mut draft.enable_color_management, "Colour-manage images");
+                        ui.checkbox(&mut draft.enable_color_management, tr!("Colour-manage images"));
                         ui.add_enabled_ui(draft.enable_color_management, |ui| {
-                            ui.label("Display profile");
-                            ui.radio_value(&mut draft.monitor_profile, MonitorProfile::Srgb, "Standard sRGB display");
+                            ui.label(tr!("Display profile"));
+                            ui.radio_value(&mut draft.monitor_profile, MonitorProfile::Srgb, tr!("Standard sRGB display"));
                             ui.horizontal(|ui| {
-                                ui.radio_value(&mut draft.monitor_profile, MonitorProfile::File, "ICC file:");
+                                ui.radio_value(&mut draft.monitor_profile, MonitorProfile::File, tr!("ICC file:"));
                                 ui.add_enabled(
                                     draft.monitor_profile == MonitorProfile::File,
                                     egui::TextEdit::singleline(&mut draft.monitor_profile_file).desired_width(200.0),
                                 );
                                 if ui.add_enabled(draft.monitor_profile == MonitorProfile::File, egui::Button::new("…")).clicked() {
                                     let mut d = rfd::FileDialog::new()
-                                        .set_title("Choose display ICC profile")
-                                        .add_filter("ICC profiles", &["icc", "icm"]);
+                                        .set_title(tr!("Choose display ICC profile"))
+                                        .add_filter(tr!("ICC profiles"), &["icc", "icm"]);
                                     if Path::new("/usr/share/color/icc").is_dir() {
                                         d = d.set_directory("/usr/share/color/icc");
                                     }
@@ -1073,21 +1092,21 @@ impl RustyPanoApp {
                                 }
                             });
                         });
-                        ui.label(RichText::new("Changes apply when the panorama is reloaded.").weak());
+                        ui.label(RichText::new(tr!("Changes apply when the panorama is reloaded.")).weak());
                     }
                     4 => {
                         let g = &mut draft.grid;
                         egui::Grid::new("grid").num_columns(2).show(ui, |ui| {
-                            ui.checkbox(&mut g.show_rows, "Horizontal lines");
-                            ui.add(egui::DragValue::new(&mut g.rows_distance).range(0.5..=90.0).suffix("°").prefix("every "));
+                            ui.checkbox(&mut g.show_rows, tr!("Horizontal lines"));
+                            ui.add(egui::DragValue::new(&mut g.rows_distance).range(0.5..=90.0).suffix("°").prefix(tr!("every ")));
                             ui.end_row();
-                            ui.checkbox(&mut g.show_columns, "Vertical lines");
-                            ui.add(egui::DragValue::new(&mut g.columns_distance).range(0.5..=180.0).suffix("°").prefix("every "));
+                            ui.checkbox(&mut g.show_columns, tr!("Vertical lines"));
+                            ui.add(egui::DragValue::new(&mut g.columns_distance).range(0.5..=180.0).suffix("°").prefix(tr!("every ")));
                             ui.end_row();
-                            ui.label("Line thickness");
+                            ui.label(tr!("Line thickness"));
                             ui.add(egui::DragValue::new(&mut g.line_width).range(0.5..=10.0).speed(0.1).suffix(" px"));
                             ui.end_row();
-                            ui.label("Colour");
+                            ui.label(tr!("Colour"));
                             let mut c = Color32::from_rgba_unmultiplied(g.color[0], g.color[1], g.color[2], g.color[3]);
                             if ui.color_edit_button_srgba(&mut c).changed() {
                                 g.color = c.to_srgba_unmultiplied();
@@ -1097,41 +1116,41 @@ impl RustyPanoApp {
                     }
                     _ => {
                         ui.horizontal(|ui| {
-                            ui.label("Maximum GPU memory per panorama");
+                            ui.label(tr!("Maximum GPU memory per panorama"));
                             ui.add(egui::DragValue::new(&mut draft.max_gpu_memory_mb).range(256..=65536).suffix(" MB").speed(16));
                         });
-                        ui.label(RichText::new("Larger panoramas are downscaled to fit.").weak());
-                        ui.checkbox(&mut draft.vsync, "Vertical sync (needs restart)");
+                        ui.label(RichText::new(tr!("Larger panoramas are downscaled to fit.")).weak());
+                        ui.checkbox(&mut draft.vsync, tr!("Vertical sync (needs restart)"));
                     }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("  OK  ").clicked() {
+                    if ui.button(tr!("OK")).clicked() {
                         action = 1;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr!("Cancel")).clicked() {
                         action = 2;
                     }
                 });
             });
         if action == 1 {
             if draft.default_hfov > MAX_HFOV {
-                error = Some(format!("The start field of view must not exceed {MAX_HFOV}°."));
+                error = Some(tr!("The start field of view must not exceed {max}°.", max = MAX_HFOV));
             } else if draft.enable_color_management
                 && draft.monitor_profile == MonitorProfile::File
                 && draft.monitor_profile_file.trim().is_empty()
             {
                 error = Some(
-                    "Pick an ICC file for the display profile, or switch to sRGB.".into(),
+                    tr!("Pick an ICC file for the display profile, or switch to sRGB.").into(),
                 );
             } else if draft.enable_color_management
                 && draft.monitor_profile == MonitorProfile::File
                 && !Path::new(draft.monitor_profile_file.trim()).exists()
             {
-                error = Some("The selected ICC file was not found.".into());
+                error = Some(tr!("The selected ICC file was not found.").into());
             }
             if let Some(e) = error {
-                self.message = Some(Message { title: "Settings".into(), text: e });
+                self.message = Some(Message { title: tr!("Settings").into(), text: e });
                 return;
             }
             let new = self.options.take().unwrap();
@@ -1142,6 +1161,7 @@ impl RustyPanoApp {
             let mru = std::mem::take(&mut self.settings.mru);
             self.settings = new;
             self.settings.mru = mru;
+            i18n::apply(self.settings.language);
             self.settings.save();
             if cm_changed {
                 self.reload(ctx);
@@ -1154,46 +1174,48 @@ impl RustyPanoApp {
     fn view_params_dialog(&mut self, ctx: &egui::Context) {
         let Some(d) = &mut self.view_params else { return };
         let mut action = 0;
-        egui::Window::new("Go to View")
+        egui::Window::new(tr!("Go to View"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 egui::Grid::new("vp").num_columns(2).show(ui, |ui| {
-                    ui.label("Yaw");
+                    ui.label(tr!("Yaw"));
                     ui.add(egui::DragValue::new(&mut d.yaw).range(0.0..=360.0).speed(0.5).max_decimals(2));
                     ui.end_row();
-                    ui.label("Pitch");
+                    ui.label(tr!("Pitch"));
                     ui.add(egui::DragValue::new(&mut d.pitch).range(-90.0..=90.0).speed(0.5).max_decimals(2));
                     ui.end_row();
-                    ui.label("Field of view");
+                    ui.label(tr!("Field of view"));
                     ui.add(egui::DragValue::new(&mut d.hfov).range(0.5..=MAX_HFOV).speed(0.5).max_decimals(2));
                     ui.end_row();
                 });
                 if d.confirm_default {
                     ui.separator();
                     ui.label(
-                        "Use these values as the start view for every image\n\
-                         that has no view settings of its own?",
+                        tr!(
+                            "Use these values as the start view for every image\n\
+                             that has no view settings of its own?"
+                        ),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("Yes").clicked() {
+                        if ui.button(tr!("Yes")).clicked() {
                             action = 3;
                         }
-                        if ui.button("No").clicked() {
+                        if ui.button(tr!("No")).clicked() {
                             d.confirm_default = false;
                         }
                     });
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("  OK  ").clicked() {
+                    if ui.button(tr!("OK")).clicked() {
                         action = 1;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr!("Cancel")).clicked() {
                         action = 2;
                     }
-                    if ui.button("Make Start View").clicked() {
+                    if ui.button(tr!("Make Start View")).clicked() {
                         d.confirm_default = true;
                     }
                 });
@@ -1209,18 +1231,18 @@ impl RustyPanoApp {
                     v.set_hfov(d.hfov);
                     let mut issues = Vec::new();
                     if (v.hfov - d.hfov).abs() > 0.01 {
-                        issues.push("field of view");
+                        issues.push(tr!("field of view"));
                     }
                     if (v.pitch - d.pitch).abs() > 0.01 {
-                        issues.push("pitch");
+                        issues.push(tr!("pitch"));
                     }
                     if (v.yaw - d.yaw.rem_euclid(360.0)).abs() > 0.01 {
-                        issues.push("yaw");
+                        issues.push(tr!("yaw"));
                     }
                     if !issues.is_empty() {
                         self.message = Some(Message {
-                            title: "Go to View".into(),
-                            text: format!("Adjusted to fit the image and window: {}.", issues.join(", ")),
+                            title: tr!("Go to View").into(),
+                            text: tr!("Adjusted to fit the image and window: {list}.", list = issues.join(", ")),
                         });
                     }
                 }
@@ -1249,18 +1271,18 @@ impl RustyPanoApp {
             .extension()
             .is_some_and(|e| ["jpg", "jpeg", "jpe"].contains(&e.to_string_lossy().to_lowercase().as_str()));
         let mut action = 0;
-        egui::Window::new("Photo Sphere Tags")
+        egui::Window::new(tr!("Photo Sphere Tags"))
             .collapsible(false)
             .resizable(true)
             .default_width(480.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label("Photo Sphere (GPano) XMP tags stored in this file:");
+                ui.label(tr!("Photo Sphere (GPano) XMP tags stored in this file:"));
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
                         egui::Grid::new("tags").striped(true).num_columns(2).min_col_width(120.0).show(ui, |ui| {
-                            ui.strong("Tag");
-                            ui.strong("Value");
+                            ui.strong(tr!("Tag"));
+                            ui.strong(tr!("Value"));
                             ui.end_row();
                             let mut names: Vec<&String> = m.tags.tags.keys().collect();
                             names.sort_by_key(|n| GPANO_TAGS.iter().position(|t| t == n).unwrap_or(usize::MAX));
@@ -1270,7 +1292,7 @@ impl RustyPanoApp {
                                 ui.end_row();
                             }
                             if m.tags.is_empty() {
-                                ui.label(RichText::new("(none)").weak());
+                                ui.label(RichText::new(tr!("(none)")).weak());
                                 ui.end_row();
                             }
                         });
@@ -1278,13 +1300,13 @@ impl RustyPanoApp {
                 });
                 ui.add_space(4.0);
                 ui.group(|ui| {
-                    ui.label("Horizon");
+                    ui.label(tr!("Horizon"));
                     ui.horizontal(|ui| {
-                        ui.label("Height from top");
+                        ui.label(tr!("Height from top"));
                         ui.add(egui::DragValue::new(&mut m.horizon).range(0.0..=100.0).suffix(" %"));
                         if ui
-                            .button("Write Crop Tags")
-                            .on_hover_text("Store the horizon height as GPano cropped-area tags")
+                            .button(tr!("Write Crop Tags"))
+                            .on_hover_text(tr!("Store the horizon height as GPano cropped-area tags"))
                             .clicked()
                         {
                             let w = p.loaded.width as f64;
@@ -1301,20 +1323,22 @@ impl RustyPanoApp {
                             m.tags.set("CroppedAreaTopPixels", top as u64);
                             m.dirty = true;
                             m.note = Some(
-                                "Tags changed. Press OK to write them into the file, then reopen the image \
-                                 to apply the new horizon."
-                                    .into(),
+                                tr!(
+                                    "Tags changed. Press OK to write them into the file, then reopen the image \
+                                     to apply the new horizon."
+                                )
+                                .into(),
                             );
                         }
                     });
                 });
                 ui.group(|ui| {
-                    ui.label("Start view");
+                    ui.label(tr!("Start view"));
                     let v = &p.view;
-                    ui.label(format!("Yaw {:.1}°   Pitch {:.1}°   HFOV {:.1}°", v.yaw, v.pitch, v.hfov));
+                    ui.label(tr!("Yaw {yaw}°   Pitch {pitch}°   Field of view {fov}°", yaw = format!("{:.1}", v.yaw), pitch = format!("{:.1}", v.pitch), fov = format!("{:.1}", v.hfov)));
                     if ui
-                        .button("Use Current View")
-                        .on_hover_text("Save the current yaw, pitch and field of view as the view shown when the file is opened")
+                        .button(tr!("Use Current View"))
+                        .on_hover_text(tr!("Save the current yaw, pitch and field of view as the view shown when the file is opened"))
                         .clicked()
                     {
                         let pose = m.tags.get("PoseHeadingDegrees").unwrap_or(0.0);
@@ -1324,7 +1348,7 @@ impl RustyPanoApp {
                         m.tags.set("InitialHorizontalFOVDegrees", format!("{:.1}", v.hfov));
                         m.dirty = true;
                         m.note = Some(
-                            "Tags changed. Press OK to write them into the file."
+                            tr!("Tags changed. Press OK to write them into the file.")
                                 .into(),
                         );
                     }
@@ -1333,14 +1357,14 @@ impl RustyPanoApp {
                     ui.label(RichText::new(n).color(Color32::from_rgb(230, 190, 80)));
                 }
                 if !is_jpeg {
-                    ui.label(RichText::new("Writing tags is supported for JPEG files only.").weak());
+                    ui.label(RichText::new(tr!("Writing tags is supported for JPEG files only.")).weak());
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(is_jpeg || !m.dirty, egui::Button::new("  OK  ")).clicked() {
+                    if ui.add_enabled(is_jpeg || !m.dirty, egui::Button::new(tr!("OK"))).clicked() {
                         action = 1;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr!("Cancel")).clicked() {
                         action = 2;
                     }
                 });
@@ -1357,7 +1381,7 @@ impl RustyPanoApp {
                             }
                         }
                         Err(e) => {
-                            self.message = Some(Message { title: "Photo Sphere Tags".into(), text: format!("Could not save the tags:\n{e}") })
+                            self.message = Some(Message { title: tr!("Photo Sphere Tags").into(), text: tr!("Could not save the tags:\n{error}", error = e) })
                         }
                     }
                 }
@@ -1374,12 +1398,12 @@ impl RustyPanoApp {
             return;
         };
         let mut action = 0;
-        egui::Window::new("Jump to Hotspot")
+        egui::Window::new(tr!("Jump to Hotspot"))
             .collapsible(false)
             .resizable(false)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label("Destinations in this panorama:");
+                ui.label(tr!("Destinations in this panorama:"));
                 egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
                     ui.set_min_width(300.0);
                     for (i, h) in p.hotspots.iter().enumerate() {
@@ -1399,10 +1423,10 @@ impl RustyPanoApp {
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(sel.is_some(), egui::Button::new("  OK  ")).clicked() {
+                    if ui.add_enabled(sel.is_some(), egui::Button::new(tr!("OK"))).clicked() {
                         action = 1;
                     }
-                    if ui.button("Cancel").clicked() {
+                    if ui.button(tr!("Cancel")).clicked() {
                         action = 2;
                     }
                 });

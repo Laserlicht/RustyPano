@@ -26,10 +26,10 @@ impl Interpolator {
         [Interpolator::Nearest, Interpolator::Bilinear, Interpolator::Bicubic, Interpolator::Lanczos3];
     pub fn label(self) -> &'static str {
         match self {
-            Interpolator::Nearest => "Nearest neighbour (blocky)",
-            Interpolator::Bilinear => "Trilinear (smooth, quickest)",
-            Interpolator::Bicubic => "Bicubic Catmull-Rom (sharp)",
-            Interpolator::Lanczos3 => "Lanczos3 (sharpest)",
+            Interpolator::Nearest => tr!("Nearest neighbour (blocky)"),
+            Interpolator::Bilinear => tr!("Trilinear (smooth, quickest)"),
+            Interpolator::Bicubic => tr!("Bicubic Catmull-Rom (sharp)"),
+            Interpolator::Lanczos3 => tr!("Lanczos3 (sharpest)"),
         }
     }
     pub fn shader_id(self) -> u32 {
@@ -72,6 +72,7 @@ impl Default for GridSettings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub language: crate::i18n::LanguageChoice,
     pub default_yaw: f64,
     pub default_pitch: f64,
     pub default_hfov: f64,
@@ -97,6 +98,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            language: crate::i18n::LanguageChoice::Auto,
             default_yaw: 180.0,
             default_pitch: 0.0,
             default_hfov: 70.0,

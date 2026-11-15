@@ -80,7 +80,7 @@ pub fn start_load(
     overrides: Option<Overrides>,
 ) -> LoadJob {
     let progress = Arc::new(AtomicU32::new(0));
-    let stage = Arc::new(Mutex::new("Reading".to_string()));
+    let stage = Arc::new(Mutex::new(tr!("Reading").to_string()));
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let s = settings.clone();
@@ -126,7 +126,7 @@ fn sniff(path: &Path) -> Sniffed {
 
 /// Decode any supported image, returning the pixels and the embedded ICC profile.
 fn decode(path: &Path) -> Result<(image::DynamicImage, Option<Vec<u8>>), String> {
-    let err = |e: &dyn std::fmt::Display| format!("Cannot decode this image: {e}");
+    let err = |e: &dyn std::fmt::Display| tr!("Cannot decode this image: {error}", error = e);
     match sniff(path) {
         Sniffed::Jxl => {
             let f = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
@@ -164,20 +164,20 @@ fn load(
         ctx.request_repaint();
     };
     if !path.exists() {
-        return Err(format!("No such file: {}", path.display()));
+        return Err(tr!("No such file: {path}", path = path.display()));
     }
     let is_fsv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fsv"));
     let mut params = if is_fsv { PanoParams::read_fsv(path)? } else { PanoParams::default() };
     let image_path = if is_fsv { params.image.clone() } else { path.to_path_buf() };
     if !image_path.exists() {
-        return Err(format!("No such file: {}", image_path.display()));
+        return Err(tr!("No such file: {path}", path = image_path.display()));
     }
     let gpano = GPano::read(&image_path);
     if !is_fsv {
         params = PanoParams::from_image(&image_path, &gpano);
     }
 
-    set_stage("Decoding");
+    set_stage(tr!("Decoding"));
     let (img, icc) = decode(&image_path)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
@@ -189,7 +189,7 @@ fn load(
     // ---- colour management -------------------------------------------------
     let mut icc_used = None;
     if settings.enable_color_management {
-        set_stage("Colour management");
+        set_stage(tr!("Colour management"));
         let output = match settings.monitor_profile {
             MonitorProfile::File if !settings.monitor_profile_file.is_empty() => {
                 qcms::Profile::new_from_path(&settings.monitor_profile_file)
@@ -215,7 +215,7 @@ fn load(
                         s.spawn(move || xf.apply(chunk));
                     }
                 });
-                icc_used = Some(if icc.is_some() { "embedded ICC".into() } else { "sRGB (assumed)".into() });
+                icc_used = Some(if icc.is_some() { tr!("embedded ICC").into() } else { tr!("sRGB (assumed)").into() });
             }
         }
     }
@@ -232,13 +232,13 @@ fn load(
         let layout = TileLayout::new(gw, gh, max_tile);
         let bytes = layout.tile_size as u64 * layout.tile_size as u64 * 4 * 4 / 3 * layout.layers() as u64;
         if (layout.layers() > max_layers || bytes > budget) && gw >= 1024 {
-            set_stage("Downscaling");
+            set_stage(tr!("Downscaling"));
             rgb = halve(&rgb);
             downscale *= 2;
             (gw, gh) = (rgb.width(), rgb.height());
             continue;
         }
-        set_stage("Uploading to GPU");
+        set_stage(tr!("Uploading to GPU"));
         let tex = upload(&rgb, &layout, device, queue, progress, cancel, ctx);
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
@@ -251,7 +251,7 @@ fn load(
         log::warn!("GPU upload of {gw}x{gh} failed verification (out of video memory?), downscaling");
         tex.destroy();
         drop(tex);
-        set_stage("Downscaling");
+        set_stage(tr!("Downscaling"));
         rgb = halve(&rgb);
         downscale *= 2;
         (gw, gh) = (rgb.width(), rgb.height());
