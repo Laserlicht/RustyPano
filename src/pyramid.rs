@@ -327,9 +327,12 @@ impl JpegRows {
         match self.dec.raw_output().decode_next_imcu_row(&mut planes, &strides).map_err(err)? {
             zune_jpeg::RawImcuRowStatus::RowReady { rows_written } => {
                 for (c, p) in self.planes.iter().enumerate() {
+                    // Only the real samples: the edge is repeated when
+                    // up-sampling, not the block padding.
+                    let width = self.width.div_ceil(self.fx[c]);
                     for r in 0..rows_written[c] {
                         let start = r * p.stride;
-                        self.rows[c].push_back(self.imcu[c][start..start + p.width].to_vec());
+                        self.rows[c].push_back(self.imcu[c][start..start + width].to_vec());
                     }
                     self.received[c] += rows_written[c];
                 }
@@ -343,7 +346,7 @@ impl JpegRows {
 
     fn ready(&self, y: usize) -> bool {
         (0..self.planes.len()).all(|c| {
-            let (a, b) = needed_rows(self.planes[c].height, self.fy[c], y);
+            let (a, b) = needed_rows(self.height.div_ceil(self.fy[c]), self.fy[c], y);
             self.received[c] > a.max(b)
         })
     }
@@ -354,7 +357,7 @@ impl JpegRows {
             return;
         }
         for c in 0..self.planes.len() {
-            let (a, b) = needed_rows(self.planes[c].height, self.fy[c], self.next_out);
+            let (a, b) = needed_rows(self.height.div_ceil(self.fy[c]), self.fy[c], self.next_out);
             while self.first[c] < a.min(b) {
                 self.rows[c].pop_front();
                 self.first[c] += 1;
@@ -473,7 +476,7 @@ impl RowReader for JpegRows {
         let view = RowsView {
             rows: &self.rows,
             first: &self.first,
-            heights: self.planes.iter().map(|p| p.height).collect(),
+            heights: self.fy.iter().map(|f| self.height.div_ceil(*f)).collect(),
             fx: &self.fx,
             fy: &self.fy,
             width: self.width,
@@ -491,8 +494,9 @@ impl RowReader for JpegRows {
     }
 }
 
-/// Streaming reader for baseline/sequential JPEGs in grey, YCbCr or RGB with
-/// 1×/2× chroma subsampling; `None` for anything else (progressive, CMYK, …),
+/// Streaming reader for JPEGs in grey, YCbCr or RGB with
+/// 1×/2× chroma subsampling, baseline or progressive; `None` for anything
+/// else (CMYK, arithmetic coding, …),
 /// which is decoded as a whole instead.
 fn open_jpeg(mut input: Input) -> Result<Option<Decoded>, String> {
     use zune_jpeg::zune_core::colorspace::ColorSpace;
@@ -504,7 +508,6 @@ fn open_jpeg(mut input: Input) -> Result<Option<Decoded>, String> {
         return Ok(None);
     }
     let Some(info) = dec.info() else { return Ok(None) };
-    let sequential = info.sof.is_sequential_dct();
     let colour = match (dec.input_colorspace(), info.components) {
         (Some(ColorSpace::Luma), 1) => JpegColour::Gray,
         (Some(ColorSpace::YCbCr), 3) => JpegColour::YCbCr,
@@ -512,7 +515,7 @@ fn open_jpeg(mut input: Input) -> Result<Option<Decoded>, String> {
         _ => return Ok(None),
     };
     let (w, h) = (info.width as usize, info.height as usize);
-    if !sequential || w == 0 || h == 0 {
+    if w == 0 || h == 0 {
         return Ok(None);
     }
     let Some(layout) = dec.raw_output().layout() else { return Ok(None) };
@@ -524,6 +527,20 @@ fn open_jpeg(mut input: Input) -> Result<Option<Decoded>, String> {
     let fy: Option<Vec<usize>> = planes.iter().map(|p| factor(vmax, p.vertical_sampling_factor)).collect();
     let (Some(fx), Some(fy)) = (fx, fy) else { return Ok(None) };
     check_pixels(w as u32, h as u32, MAX_STREAM_PIXELS)?;
+    // Progressive: every pixel is refined until the last scan, so all DCT
+    // coefficients (2 bytes per sample) are kept until the end; only the
+    // output is streamed. In the browser that must fit into 4 GB.
+    #[cfg(target_arch = "wasm32")]
+    if !info.sof.is_sequential_dct() {
+        let coefficients: u64 = planes.iter().map(|p| p.stride as u64 * p.allocated_height as u64 * 2).sum();
+        if coefficients > MAX_COEFFICIENT_BYTES {
+            return Err(tr!(
+                "This panorama ({w}×{h}) is a progressive JPEG and too large for the browser version; saved as a baseline JPEG it can be opened.",
+                w = w,
+                h = h
+            ));
+        }
+    }
     let icc = dec.icc_profile();
     let n = planes.len();
     let imcu = planes.iter().map(|p| vec![0u8; p.stride * p.vertical_sampling_factor * 8]).collect();
@@ -580,6 +597,10 @@ fn check_pixels(w: u32, h: u32, max: u64) -> Result<(), String> {
 const MAX_FULL_PIXELS: u64 = 300_000_000;
 #[cfg(target_arch = "wasm32")]
 const MAX_STREAM_PIXELS: u64 = 2_000_000_000;
+/// Progressive JPEGs keep all DCT coefficients; together with the file and
+/// the tiles being built this must stay below the 4 GB.
+#[cfg(target_arch = "wasm32")]
+const MAX_COEFFICIENT_BYTES: u64 = 2_900 << 20;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_FULL_PIXELS: u64 = u64::MAX;
 #[cfg(not(target_arch = "wasm32"))]
@@ -1002,15 +1023,25 @@ mod tests {
     }
 
     #[test]
-    fn progressive_jpeg_falls_back_to_full_decode() {
+    fn progressive_jpeg_is_streamed() {
+        // Progressive and baseline files with the same settings hold the same
+        // quantised coefficients, so they must decode identically.
         let img = test_image(120, 60);
-        let mut jpeg = Vec::new();
-        let mut enc = jpeg_encoder::Encoder::new(&mut jpeg, 90);
-        enc.set_progressive(true);
-        enc.encode(img.as_raw(), 120, 60, jpeg_encoder::ColorType::Rgb).unwrap();
-        let mut d = open_bytes(jpeg);
-        assert!(!d.streaming);
-        assert_eq!(read_all(&mut d, 16).len(), 120 * 60 * 3);
+        for sampling in [jpeg_encoder::SamplingFactor::R_4_4_4, jpeg_encoder::SamplingFactor::R_4_2_0] {
+            let decode = |progressive: bool| {
+                let mut jpeg = Vec::new();
+                let mut enc = jpeg_encoder::Encoder::new(&mut jpeg, 90);
+                enc.set_progressive(progressive);
+                enc.set_sampling_factor(sampling);
+                enc.encode(img.as_raw(), 120, 60, jpeg_encoder::ColorType::Rgb).unwrap();
+                let mut d = open_bytes(jpeg);
+                assert!(d.streaming);
+                read_all(&mut d, 16)
+            };
+            let progressive = decode(true);
+            assert_eq!(progressive.len(), 120 * 60 * 3);
+            assert!(progressive == decode(false), "{sampling:?}");
+        }
     }
 
     #[test]

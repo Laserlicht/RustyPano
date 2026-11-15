@@ -69,8 +69,10 @@ Storage (per tab, deleted when the tab is closed; anything a closed tab could
 not delete in time is removed the next time the page is opened). Not available in the
 browser: previous/next image in folder, recent files, saving Photo Sphere tags
 into files and display ICC profiles from files. Size limits in the browser:
-300 megapixels for progressive JPEG and WebP (decoded as a whole), 2 gigapixels
-for baseline JPEG, PNG, TIFF, JPEG XL and BMP (read in stripes).
+300 megapixels for WebP (decoded as a whole), 2 gigapixels for baseline JPEG,
+PNG, TIFF, JPEG XL and BMP (read in stripes), and progressive JPEG up to about
+2.9 GB of DCT coefficients (6 bytes per pixel without chroma subsampling, so
+about 500 megapixels; with 4:2:0 twice that).
 
 ## Controls
 
@@ -124,11 +126,13 @@ or key press stops it.
 Panoramas are shown in multiple resolutions from a tile cache, so neither the
 GPU nor main memory has to hold the whole image:
 
-- **Reading** (`src/pyramid.rs`): baseline JPEG, PNG, TIFF (strips or tiles),
-  JPEG XL and BMP are decoded stripe by stripe. Progressive JPEG needs all DCT
-  coefficients before the first row, and WebP is limited to 16383 px per side
-  anyway, so those are decoded as a whole, handed on row by row and freed
-  right afterwards. Streaming JPEG uses the iMCU-row API of
+- **Reading** (`src/pyramid.rs`): JPEG, PNG, TIFF (strips or tiles),
+  JPEG XL and BMP are decoded stripe by stripe. Progressive JPEG refines every
+  pixel until the last scan, so its DCT coefficients (2 bytes per sample) are
+  kept until the end, but the pixels are still produced stripe by stripe
+  rather than as a whole RGB image. WebP is limited to 16383 px per side
+  anyway and is decoded as a whole, handed on row by row and freed right
+  afterwards. Streaming JPEG uses the iMCU-row API of
   `zune-jpeg 0.5.16-rc3`, taken from its Git repository: as a pre-release it
   cannot share the `zune-jpeg 0.5.x` from crates.io that `image` and `tiff`
   use, but a different source may sit next to it. Switch to the crates.io

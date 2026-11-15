@@ -170,6 +170,7 @@
 "The selected ICC file was not found." = "Die ausgewählte ICC-Datei wurde nicht gefunden."
 "The start field of view must not exceed {max}°." = "Das Start-Sichtfeld darf {max}° nicht überschreiten."
 "This file type cannot be opened" = "Dieser Dateityp kann nicht geöffnet werden"
+"This panorama ({w}×{h}) is a progressive JPEG and too large for the browser version; saved as a baseline JPEG it can be opened." = "Dieses Panorama ({w}×{h}) ist ein progressives JPEG und zu groß für die Browser-Version; als Baseline-JPEG gespeichert lässt es sich öffnen."
 "This panorama ({w}×{h}) is too large for the browser version." = "Dieses Panorama ({w}×{h}) ist zu groß für die Browser-Version."
 "Tile cache in the browser" = "Kachel-Cache im Browser"
 "Tile cache is damaged" = "Der Kachel-Cache ist beschädigt"
