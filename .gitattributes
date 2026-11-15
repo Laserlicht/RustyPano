@@ -1,0 +1,7 @@
+# Keep LF line endings in every checkout (shell scripts, string literals with
+# line continuations, translation catalogs).
+* text=auto eol=lf
+
+*.png binary
+*.ico binary
+*.icns binary

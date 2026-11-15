@@ -172,7 +172,9 @@ mod tests {
             if path.extension().is_none_or(|e| e != "rs") || path.ends_with("i18n.rs") {
                 continue;
             }
-            let src = std::fs::read_to_string(&path).unwrap();
+            // rustc reads CRLF as LF (sources are checked out with CRLF on
+            // Windows); do the same so literals match.
+            let src = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
             let mut rest = src.as_str();
             while let Some(i) = rest.find("tr!(") {
                 // Skip identifiers that merely end in `tr` (e.g. `include_str!`).
