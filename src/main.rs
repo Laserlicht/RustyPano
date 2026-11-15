@@ -12,14 +12,42 @@ mod fsv;
 mod loader;
 mod render;
 mod settings;
+mod source;
 mod view;
+#[cfg(target_arch = "wasm32")]
+mod web;
 mod xmp;
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use eframe::{egui, egui_wgpu, wgpu};
+use eframe::{egui_wgpu, wgpu};
 
+/// wgpu setup shared by the native and the web build: ask for the adapter's
+/// real texture limits, because panoramas are tiled into a texture array and
+/// bigger tiles / more layers mean fewer downscales.
+fn wgpu_setup() -> egui_wgpu::WgpuSetup {
+    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
+    setup.device_descriptor = Arc::new(|adapter: &wgpu::Adapter| {
+        let a = adapter.limits();
+        let base = if adapter.get_info().backend == wgpu::Backend::Gl {
+            wgpu::Limits::downlevel_webgl2_defaults()
+        } else {
+            wgpu::Limits::default()
+        };
+        wgpu::DeviceDescriptor {
+            label: Some("rustypano device"),
+            required_limits: wgpu::Limits {
+                max_texture_dimension_2d: a.max_texture_dimension_2d.min(16384),
+                max_texture_array_layers: a.max_texture_array_layers,
+                ..base
+            },
+            ..Default::default()
+        }
+    });
+    egui_wgpu::WgpuSetup::CreateNew(setup)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn usage() -> &'static str {
     tr!("Usage: rustypano [options] [panorama image | tour.fsv]
 
@@ -34,11 +62,13 @@ Options:
   -h, --help      show this help")
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 struct Parsed {
     cli: app::CliOptions,
     geometry: Option<[f32; 4]>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parse_args() -> Result<Parsed, String> {
     let mut cli = app::CliOptions { file: None, yaw: None, pitch: None, hfov: None, fullscreen: false, hotspots_on: false };
     let mut geo: [Option<f32>; 4] = [None; 4];
@@ -54,7 +84,7 @@ fn parse_args() -> Result<Parsed, String> {
             v.parse::<f64>().map_err(|_| tr!("{name} expects a number", name = name))
         };
         if !a.starts_with('-') || a == "-" {
-            cli.file = Some(PathBuf::from(&a));
+            cli.file = Some(source::Source::Path(std::path::PathBuf::from(&a)));
             continue;
         }
         match key.as_str() {
@@ -97,14 +127,18 @@ fn parse_args() -> Result<Parsed, String> {
         [None, None, None, None] => None,
         _ => return Err(tr!("Window geometry needs -left, -top, -width and -height together").into()),
     };
-    if let Some(f) = &cli.file
-        && !f.exists() {
-            return Err(tr!("No such file: {path}", path = f.display()));
-        }
+    if let Some(f) = cli.file.as_ref().and_then(|f| f.as_path())
+        && !f.exists()
+    {
+        return Err(tr!("No such file: {path}", path = f.display()));
+    }
     Ok(Parsed { cli, geometry })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result {
+    use eframe::egui;
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,rustypano=info")).init();
     let settings = settings::Settings::load();
     i18n::apply(settings.language);
@@ -133,26 +167,6 @@ fn main() -> eframe::Result {
         vp = vp.with_position([l, t]).with_inner_size([w, h]);
     }
 
-    // Ask for the adapter's real texture limits: panoramas are tiled into a
-    // texture array, bigger tiles / more layers mean fewer downscales.
-    let mut setup = egui_wgpu::WgpuSetupCreateNew::without_display_handle();
-    setup.device_descriptor = Arc::new(|adapter: &wgpu::Adapter| {
-        let a = adapter.limits();
-        let base = if adapter.get_info().backend == wgpu::Backend::Gl {
-            wgpu::Limits::downlevel_webgl2_defaults()
-        } else {
-            wgpu::Limits::default()
-        };
-        wgpu::DeviceDescriptor {
-            label: Some("rustypano device"),
-            required_limits: wgpu::Limits {
-                max_texture_dimension_2d: a.max_texture_dimension_2d.min(16384),
-                max_texture_array_layers: a.max_texture_array_layers,
-                ..base
-            },
-            ..Default::default()
-        }
-    });
     let options = eframe::NativeOptions {
         viewport: vp,
         wgpu_options: egui_wgpu::WgpuConfiguration {
@@ -160,11 +174,53 @@ fn main() -> eframe::Result {
                 present_mode: if settings.vsync { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync },
                 ..egui_wgpu::SurfaceConfig::LOW_LATENCY
             },
-            wgpu_setup: egui_wgpu::WgpuSetup::CreateNew(setup),
+            wgpu_setup: wgpu_setup(),
             ..Default::default()
         },
         ..Default::default()
     };
     let cli = parsed.cli;
     eframe::run_native("RustyPano", options, Box::new(move |cc| Ok(Box::new(app::RustyPanoApp::new(cc, cli)))))
+}
+
+/// Browser entry point: start the app on the `<canvas id="app">` of index.html
+/// and remove the startup screen once it runs.
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    eframe::WebLogger::init(log::LevelFilter::Info).ok();
+    let settings = settings::Settings::load();
+    i18n::apply(settings.language);
+
+    let mut cli = app::CliOptions { file: None, yaw: None, pitch: None, hfov: None, fullscreen: false, hotspots_on: false };
+    for (k, v) in web::url_params() {
+        match k.as_str() {
+            "pano" if !v.is_empty() => cli.file = Some(source::Source::Url(v)),
+            "yaw" => cli.yaw = v.parse().ok().filter(|v| (0.0..=360.0).contains(v)),
+            "pitch" => cli.pitch = v.parse().ok().filter(|v| (-90.0..=90.0).contains(v)),
+            "hfov" => cli.hfov = v.parse().ok().filter(|v| (0.1..=view::MAX_HFOV).contains(v)),
+            "fs" => cli.fullscreen = v != "0",
+            _ => {}
+        }
+    }
+
+    let options = eframe::WebOptions {
+        wgpu_options: egui_wgpu::WgpuConfiguration { wgpu_setup: wgpu_setup(), ..Default::default() },
+        ..Default::default()
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        let Some(canvas) = web::canvas() else {
+            web::show_startup_error("RustyPano: missing <canvas id=\"app\">");
+            return;
+        };
+        let result = eframe::WebRunner::new()
+            .start(canvas, options, Box::new(move |cc| Ok(Box::new(app::RustyPanoApp::new(cc, cli)))))
+            .await;
+        match result {
+            Ok(()) => web::hide_loading_screen(),
+            Err(e) => {
+                let detail = e.as_string().unwrap_or_else(|| format!("{e:?}"));
+                web::show_startup_error(&tr!("RustyPano could not start: {error}", error = detail));
+            }
+        }
+    });
 }

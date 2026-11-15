@@ -18,8 +18,7 @@
 //! END HOTSPOT
 //! ```
 
-use std::path::{Path, PathBuf};
-
+use crate::source::Source;
 use crate::xmp::GPano;
 
 #[derive(Clone, Debug, Default)]
@@ -29,7 +28,8 @@ pub struct HotspotDef {
     /// Vertical position, percent of image height (0..100).
     pub y: f64,
     pub description: String,
-    pub target: PathBuf,
+    /// Target file as written in the tour, resolved against the tour's source.
+    pub target: String,
     pub initial_yaw: Option<f64>,
     pub initial_pitch: Option<f64>,
     pub initial_hfov: Option<f64>,
@@ -37,7 +37,10 @@ pub struct HotspotDef {
 
 #[derive(Clone, Debug, Default)]
 pub struct PanoParams {
-    pub image: PathBuf,
+    /// IMAGENAME as written in the tour file.
+    pub image_name: String,
+    /// The image actually displayed (set by the loader).
+    pub image: Option<Source>,
     pub window_title: Option<String>,
     pub yaw: Option<f64>,
     pub pitch: Option<f64>,
@@ -74,18 +77,16 @@ fn parse_num(v: &str, what: &str, errors: &mut Vec<String>) -> Option<f64> {
     }
 }
 
-fn resolve(base: &Path, name: &str) -> PathBuf {
-    let name = name.replace('\\', "/");
-    let p = PathBuf::from(&name);
-    if p.is_absolute() { p } else { base.join(p) }
+/// Tour files are UTF-8 or, in older files, Latin-1.
+pub fn decode_text(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.trim_start_matches('\u{feff}').to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
 }
 
 impl PanoParams {
-    pub fn read_fsv(path: &Path) -> Result<Self, String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let text = String::from_utf8(bytes.clone())
-            .unwrap_or_else(|_| bytes.iter().map(|&b| b as char).collect()); // Latin-1 fallback
-        let base = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    pub fn parse_fsv(text: &str) -> Result<Self, String> {
         let mut p = PanoParams::default();
         let mut errors = Vec::new();
         let mut cur: Option<HotspotDef> = None;
@@ -113,7 +114,7 @@ impl PanoParams {
                         errors.push(tr!("A hotspot has no X position").into());
                     } else if !has_y {
                         errors.push(tr!("A hotspot has no Y position").into());
-                    } else if h.target.as_os_str().is_empty() {
+                    } else if h.target.is_empty() {
                         errors.push(tr!("A hotspot has no TARGET").into());
                     } else if !(0.0..=100.0).contains(&h.x) {
                         errors.push(tr!("Hotspot X must lie between 0 and 100").into());
@@ -139,7 +140,7 @@ impl PanoParams {
                 } else if let Some(v) = strip_key(line, &up, "DESCRIPTION=") {
                     h.description = v.to_string();
                 } else if let Some(v) = strip_key(line, &up, "TARGET=") {
-                    h.target = resolve(&base, v);
+                    h.target = v.to_string();
                 } else if let Some(v) = strip_key(line, &up, "INITIALYAW=") {
                     h.initial_yaw = parse_num(v, tr!("Hotspot INITIALYAW"), &mut errors);
                 } else if let Some(v) = strip_key(line, &up, "INITIALPITCH=") {
@@ -150,7 +151,7 @@ impl PanoParams {
                 continue;
             }
             if let Some(v) = strip_key(line, &up, "IMAGENAME=") {
-                p.image = resolve(&base, v);
+                p.image_name = v.to_string();
             } else if let Some(v) = strip_key(line, &up, "WINDOWTITLE=") {
                 p.window_title = Some(v.to_string());
             } else if let Some(v) = strip_key(line, &up, "YAW=") {
@@ -181,7 +182,7 @@ impl PanoParams {
     }
 
     fn check(&self, errors: &mut Vec<String>) {
-        if self.image.as_os_str().is_empty() {
+        if self.image_name.is_empty() {
             errors.push(tr!("IMAGENAME is not set").into());
         }
         if let Some(h) = self.horizon_position
@@ -219,8 +220,8 @@ impl PanoParams {
     }
 
     /// Parameters for a bare image, filled from its GPano XMP tags.
-    pub fn from_image(path: &Path, gpano: &GPano) -> Self {
-        let mut p = PanoParams { image: path.to_path_buf(), ..Default::default() };
+    pub fn from_image(source: Source, gpano: &GPano) -> Self {
+        let mut p = PanoParams { image: Some(source), ..Default::default() };
         p.apply_gpano(gpano);
         p
     }
@@ -258,30 +259,26 @@ mod tests {
 
     #[test]
     fn parses_fsv() {
-        let dir = std::env::temp_dir().join("fsv_test_rs");
-        std::fs::create_dir_all(&dir).unwrap();
-        let f = dir.join("a.fsv");
-        std::fs::write(
-            &f,
-            "// comment\nImageName=sub\\pano.jpg\nyaw=10\nPITCH=-5\nHFOV=60\nHorizonPosition=40\nAUTOSPIN=0.5\n\
-             BEGIN HOTSPOT\nX=25\nY=50\nDESCRIPTION=Door\nTARGET=b.fsv\nINITIALYAW=90\nEND HOTSPOT\n",
-        )
-        .unwrap();
-        let p = PanoParams::read_fsv(&f).unwrap();
-        assert_eq!(p.image, dir.join("sub/pano.jpg"));
+        let text = "// comment\nImageName=sub\\pano.jpg\nyaw=10\nPITCH=-5\nHFOV=60\nHorizonPosition=40\nAUTOSPIN=0.5\n\
+                    BEGIN HOTSPOT\nX=25\nY=50\nDESCRIPTION=Door\nTARGET=b.fsv\nINITIALYAW=90\nEND HOTSPOT\n";
+        let p = PanoParams::parse_fsv(text).unwrap();
+        assert_eq!(p.image_name, "sub\\pano.jpg");
         assert_eq!(p.yaw, Some(10.0));
         assert_eq!(p.pitch, Some(-5.0));
         assert_eq!(p.horizon_position, Some(40.0));
         assert_eq!(p.hotspots.len(), 1);
         assert_eq!(p.hotspots[0].description, "Door");
-        assert_eq!(p.hotspots[0].target, dir.join("b.fsv"));
+        assert_eq!(p.hotspots[0].target, "b.fsv");
         assert_eq!(p.hotspots[0].initial_yaw, Some(90.0));
     }
 
     #[test]
     fn rejects_unterminated_hotspot() {
-        let f = std::env::temp_dir().join("fsv_test_rs_bad.fsv");
-        std::fs::write(&f, "IMAGENAME=x.jpg\nBEGIN HOTSPOT\nX=1\n").unwrap();
-        assert!(PanoParams::read_fsv(&f).is_err());
+        assert!(PanoParams::parse_fsv("IMAGENAME=x.jpg\nBEGIN HOTSPOT\nX=1\n").is_err());
+    }
+
+    #[test]
+    fn decodes_latin1() {
+        assert_eq!(decode_text(b"DESCRIPTION=K\xfcche"), "DESCRIPTION=K\u{fc}che");
     }
 }

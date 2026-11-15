@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT -->
+<!-- Copyright (c) 2026 RustyPano contributors -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#1b1b1b">
+  <title>RustyPano</title>
+  <link rel="icon" type="image/png" href="icon256.png">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1b1b1b;
+    }
+    /* The app always fills the whole viewport. */
+    #app {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      outline: none;
+      touch-action: none;
+    }
+    /* Startup screen, removed by the app once it runs. */
+    #loading {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 20px;
+      background: #1b1b1b;
+      color: #b8b8b8;
+      font: 15px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+      text-align: center;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    #loading img {
+      width: 128px;
+      height: 128px;
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(0.92); opacity: 0.7; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #loading img { animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="app"></canvas>
+  <div id="loading">
+    <img src="icon256.png" alt="RustyPano">
+    <div id="loading-text">Loading RustyPano…</div>
+  </div>
+  <script type="module">
+    const de = (navigator.languages || [navigator.language]).some(l => /^de\b/i.test(l));
+    const text = document.getElementById("loading-text");
+    if (de) {
+      document.documentElement.lang = "de";
+      text.textContent = "RustyPano wird geladen…";
+    }
+    import init from "./rustypano.js";
+    init().catch((e) => {
+      // A panic during start-up also lands here.
+      text.textContent = (de ? "RustyPano konnte nicht gestartet werden: " : "RustyPano could not start: ") + e;
+    });
+  </script>
+</body>
+</html>

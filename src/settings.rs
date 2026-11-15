@@ -115,39 +115,51 @@ impl Default for Settings {
             show_toolbar: true,
             show_status_bar: true,
             vsync: true,
-            max_gpu_memory_mb: 3072,
+            // Browsers give a page far less memory than a native process.
+            max_gpu_memory_mb: if cfg!(target_arch = "wasm32") { 1024 } else { 3072 },
             mru: Vec::new(),
         }
     }
 }
 
 pub const MRU_LEN: usize = 9;
+#[cfg(target_arch = "wasm32")]
+const STORAGE_KEY: &str = "rustypano.settings";
 
 impl Settings {
+    #[cfg(not(target_arch = "wasm32"))]
     fn path() -> Option<PathBuf> {
         dirs::config_dir().map(|d| d.join("rustypano").join("settings.toml"))
     }
 
     pub fn load() -> Settings {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
+        #[cfg(not(target_arch = "wasm32"))]
+        let text = Self::path().and_then(|p| std::fs::read_to_string(p).ok());
+        #[cfg(target_arch = "wasm32")]
+        let text = crate::web::storage_get(STORAGE_KEY);
+        text.and_then(|s| toml::from_str(&s).ok()).unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let Some(p) = Self::path() else { return };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        match toml::to_string_pretty(self) {
-            Ok(s) => {
-                if let Err(e) = std::fs::write(&p, s) {
-                    log::warn!("Cannot save settings to {}: {e}", p.display());
-                }
+        let text = match toml::to_string_pretty(self) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("Cannot serialize settings: {e}");
+                return;
             }
-            Err(e) => log::warn!("Cannot serialize settings: {e}"),
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(p) = Self::path() else { return };
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&p, text) {
+                log::warn!("Cannot save settings to {}: {e}", p.display());
+            }
         }
+        #[cfg(target_arch = "wasm32")]
+        crate::web::storage_set(STORAGE_KEY, &text);
     }
 
     pub fn push_mru(&mut self, path: PathBuf) {

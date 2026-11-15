@@ -2,9 +2,10 @@
 // Copyright (c) 2026 RustyPano contributors
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+
+use web_time::Instant;
 
 use eframe::egui::{
     self, Align2, Color32, CursorIcon, Key, KeyboardShortcut, Modifiers, Pos2, Rect, RichText, Sense,
@@ -17,17 +18,20 @@ use crate::i18n::{self, LanguageChoice};
 use crate::loader::{self, LoadJob, LoadedPano, Overrides};
 use crate::render::{PanoCallback, PanoRenderer, Uniforms};
 use crate::settings::{Interpolator, MonitorProfile, PanningMode, Settings};
+use crate::source::Source;
 use crate::view::{MAX_HFOV, PanoGeometry, UserLimits, View};
-use crate::xmp::{self, GPANO_TAGS, GPano};
+use crate::xmp::{GPANO_TAGS, GPano};
 
 const HOTSPOT_RADIUS: f32 = 12.0;
 
 pub struct CliOptions {
-    pub file: Option<PathBuf>,
+    pub file: Option<Source>,
     pub yaw: Option<f64>,
     pub pitch: Option<f64>,
     pub hfov: Option<f64>,
     pub fullscreen: bool,
+    /// `-hson`: accepted for compatibility, hotspots are shown by default.
+    #[allow(dead_code)]
     pub hotspots_on: bool,
 }
 
@@ -46,11 +50,12 @@ struct Pano {
 }
 
 impl Pano {
-    fn image_path(&self) -> &Path {
-        &self.loaded.params.image
+    /// Local path of the displayed image, if it is a local file.
+    fn image_path(&self) -> Option<&Path> {
+        self.loaded.image_source().as_path()
     }
     fn file_name(&self) -> String {
-        self.loaded.source.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+        self.loaded.source.file_name()
     }
 }
 
@@ -112,6 +117,21 @@ pub struct RustyPanoApp {
     screenshot: Option<(PathBuf, u32)>,
     /// Size of the viewer area in physical pixels, from the last frame.
     viewport_px: (f64, f64),
+    /// Files read asynchronously (browser file picker / drag and drop) that
+    /// should be opened on the next frame.
+    incoming: Arc<Mutex<Option<Source>>>,
+}
+
+/// Of several files opened together, the one to show: the first tour file,
+/// else the first supported image. All of them stay available to the tour.
+#[cfg(target_arch = "wasm32")]
+fn main_file(files: Vec<(String, Vec<u8>)>) -> Option<Source> {
+    let group = Source::memory_group(files);
+    group
+        .iter()
+        .find(|s| s.is_fsv())
+        .or_else(|| group.iter().find(|s| loader::is_supported_ext(&s.extension())))
+        .cloned()
 }
 
 fn srgb_to_linear(c: u8) -> f32 {
@@ -149,6 +169,7 @@ impl RustyPanoApp {
             about: false,
             screenshot: std::env::var_os("RUSTYPANO_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
             viewport_px: (1280.0, 720.0),
+            incoming: Arc::new(Mutex::new(None)),
             settings,
         };
         if let Ok(i) = std::env::var("RUSTYPANO_INTERP") {
@@ -175,13 +196,13 @@ impl RustyPanoApp {
 
     // ------------------------------------------------------------------ files
 
-    fn open(&mut self, ctx: &egui::Context, path: PathBuf, overrides: Option<Overrides>) {
+    fn open(&mut self, ctx: &egui::Context, source: Source, overrides: Option<Overrides>) {
         if let Some(j) = self.job.take() {
             j.cancel.store(true, Ordering::Relaxed);
         }
         self.speed_test = None;
         self.job = Some(loader::start_load(
-            path,
+            source,
             &self.settings,
             self.device.clone(),
             self.queue.clone(),
@@ -190,6 +211,7 @@ impl RustyPanoApp {
         ));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let mut d = rfd::FileDialog::new()
             .set_title(tr!("Choose a panorama"))
@@ -200,19 +222,44 @@ impl RustyPanoApp {
             d = d.set_directory(dir);
         }
         if let Some(p) = d.pick_file() {
-            self.open(ctx, p, None);
+            self.open(ctx, Source::Path(p), None);
         }
     }
 
+    /// In the browser, several files can be picked at once so that a tour
+    /// file finds the images it refers to.
+    #[cfg(target_arch = "wasm32")]
+    fn open_dialog(&mut self, ctx: &egui::Context) {
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title(tr!("Choose a panorama"))
+            .add_filter(tr!("Panoramas"), &[loader::IMAGE_EXTENSIONS, &["fsv"]].concat());
+        let incoming = self.incoming.clone();
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let Some(handles) = dialog.pick_files().await else { return };
+            let mut files = Vec::new();
+            for h in handles {
+                files.push((h.file_name(), h.read().await));
+            }
+            *incoming.lock().unwrap() = main_file(files);
+            ctx.request_repaint();
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     fn current_dir(&self) -> Option<PathBuf> {
         self.pano
             .as_ref()
-            .and_then(|p| p.image_path().parent().map(Path::to_path_buf))
+            .and_then(|p| p.image_path()?.parent().map(Path::to_path_buf))
             .or_else(|| self.settings.mru.first().and_then(|p| p.parent().map(Path::to_path_buf)))
     }
 
+    /// Previous/next image in the same folder (local files only).
     fn folder_neighbour(&self, step: i32) -> Option<PathBuf> {
-        let cur = self.pano.as_ref()?.image_path().to_path_buf();
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
+        let cur = self.pano.as_ref()?.image_path()?.to_path_buf();
         let dir = cur.parent()?;
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
             .ok()?
@@ -242,7 +289,7 @@ impl RustyPanoApp {
             Err(e) => {
                 self.message = Some(Message {
                     title: tr!("Could not open").into(),
-                    text: format!("{}\n\n{e}", job.path.display()),
+                    text: format!("{}\n\n{e}", job.name),
                 })
             }
         }
@@ -279,14 +326,19 @@ impl RustyPanoApp {
         let autospin = p.autospin.unwrap_or(0.0);
         self.title = match &p.window_title {
             Some(t) if !t.is_empty() => t.clone(),
-            _ => format!(
-                "RustyPano - {}",
-                loaded.source.file_name().map(|s| s.to_string_lossy()).unwrap_or_default()
-            ),
+            _ => format!("RustyPano - {}", loaded.source.file_name()),
         };
+        #[cfg(not(target_arch = "wasm32"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
-        self.settings.push_mru(loaded.source.clone());
-        self.settings.save();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+            crate::web::set_title(&self.title);
+        }
+        if let Some(path) = loaded.source.as_path() {
+            self.settings.push_mru(path.to_path_buf());
+            self.settings.save();
+        }
         self.metadata = None;
         self.hotspot_list = None;
         self.pano = Some(Pano { loaded, view, hotspots, autospin });
@@ -302,7 +354,13 @@ impl RustyPanoApp {
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, on: bool) {
         self.fullscreen = on;
+        #[cfg(not(target_arch = "wasm32"))]
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = ctx;
+            crate::web::set_fullscreen(on);
+        }
     }
 
     // ------------------------------------------------------------------ input
@@ -327,7 +385,7 @@ impl RustyPanoApp {
         if open {
             self.open_dialog(ctx);
         }
-        if quit {
+        if quit && !cfg!(target_arch = "wasm32") {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         if prev {
@@ -359,7 +417,7 @@ impl RustyPanoApp {
 
     fn go_neighbour(&mut self, ctx: &egui::Context, step: i32) {
         if let Some(p) = self.folder_neighbour(step) {
-            self.open(ctx, p, None);
+            self.open(ctx, Source::Path(p), None);
         }
     }
 
@@ -440,9 +498,10 @@ impl RustyPanoApp {
         }
 
         // Drag & drop.
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        if let Some(f) = dropped.into_iter().next() {
-            self.open(&ctx, f, None);
+        self.handle_dropped_files(&ctx);
+        let incoming = self.incoming.lock().unwrap().take();
+        if let Some(src) = incoming {
+            self.open(&ctx, src, None);
         }
 
         if self.pano.is_none() {
@@ -491,7 +550,7 @@ impl RustyPanoApp {
             }
 
         // Clicks.
-        let mut open_target: Option<(PathBuf, Overrides)> = None;
+        let mut open_target: Option<(Result<Source, String>, Overrides)> = None;
         if response.clicked() {
             if self.horizon_tool {
                 if let Some(pos) = response.interact_pointer_pos() {
@@ -517,7 +576,7 @@ impl RustyPanoApp {
             } else if let Some(i) = self.hovered_hotspot {
                 let d = &pano.hotspots[i].def;
                 open_target = Some((
-                    d.target.clone(),
+                    pano.loaded.source.resolve(&d.target),
                     Overrides { yaw: d.initial_yaw, pitch: d.initial_pitch, hfov: d.initial_hfov },
                 ));
             }
@@ -713,9 +772,43 @@ impl RustyPanoApp {
 
         self.loading_overlay(&painter, rect);
 
-        if let Some((target, ov)) = open_target {
-            self.open(&ctx, target, Some(ov));
+        match open_target {
+            Some((Ok(target), ov)) => self.open(&ctx, target, Some(ov)),
+            Some((Err(e), _)) => self.message = Some(Message { title: tr!("Could not open").into(), text: e }),
+            None => {}
         }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect()
+        });
+        if let Some(f) = dropped.into_iter().next() {
+            self.open(ctx, Source::Path(f), None);
+        }
+    }
+
+    /// Browsers hand over file contents asynchronously; all files dropped at
+    /// once are kept together so a tour finds its images.
+    #[cfg(target_arch = "wasm32")]
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped.is_empty() {
+            return;
+        }
+        let incoming = self.incoming.clone();
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let mut files = Vec::new();
+            for f in &dropped {
+                if let Ok(bytes) = f.bytes_async().await {
+                    files.push((f.path().to_string_lossy().into_owned(), bytes));
+                }
+            }
+            *incoming.lock().unwrap() = main_file(files);
+            ctx.request_repaint();
+        });
     }
 
     fn loading_overlay(&self, painter: &egui::Painter, rect: Rect) {
@@ -745,6 +838,8 @@ impl RustyPanoApp {
                 if ui.add(egui::Button::new(tr!("Open…")).shortcut_text(tr!("Ctrl+O"))).clicked() {
                     self.open_dialog(&ctx);
                 }
+                // Recent files and Exit only make sense for the desktop app.
+                #[cfg(not(target_arch = "wasm32"))]
                 ui.menu_button(tr!("Recent Files"), |ui| {
                     if self.settings.mru.is_empty() {
                         ui.label(tr!("(none)"));
@@ -758,7 +853,7 @@ impl RustyPanoApp {
                     }
                     if let Some(p) = chosen {
                         if p.exists() {
-                            self.open(&ctx, p, None);
+                            self.open(&ctx, Source::Path(p), None);
                         } else {
                             self.settings.mru.retain(|m| m != &p);
                             self.message =
@@ -766,9 +861,12 @@ impl RustyPanoApp {
                         }
                     }
                 });
-                ui.separator();
-                if ui.add(egui::Button::new(tr!("Exit")).shortcut_text(tr!("Ctrl+Q"))).clicked() {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    ui.separator();
+                    if ui.add(egui::Button::new(tr!("Exit")).shortcut_text(tr!("Ctrl+Q"))).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
                 }
             });
             ui.menu_button(tr!("Edit"), |ui| {
@@ -805,10 +903,10 @@ impl RustyPanoApp {
                 let prev = self.folder_neighbour(-1);
                 let next = self.folder_neighbour(1);
                 if ui.add_enabled(prev.is_some(), egui::Button::new(tr!("Previous in Folder")).shortcut_text(tr!("Alt+Left"))).clicked() {
-                    self.open(&ctx, prev.unwrap(), None);
+                    self.open(&ctx, Source::Path(prev.unwrap()), None);
                 }
                 if ui.add_enabled(next.is_some(), egui::Button::new(tr!("Next in Folder")).shortcut_text(tr!("Alt+Right"))).clicked() {
-                    self.open(&ctx, next.unwrap(), None);
+                    self.open(&ctx, Source::Path(next.unwrap()), None);
                 }
             });
             ui.menu_button(tr!("Tools"), |ui| {
@@ -857,10 +955,10 @@ impl RustyPanoApp {
             let prev = self.folder_neighbour(-1);
             let next = self.folder_neighbour(1);
             if ui.add_enabled(prev.is_some(), egui::Button::new(tr!("< Prev"))).on_hover_text(tr!("Previous in folder (Alt+Left)")).clicked() {
-                self.open(&ctx, prev.unwrap(), None);
+                self.open(&ctx, Source::Path(prev.unwrap()), None);
             }
             if ui.add_enabled(next.is_some(), egui::Button::new(tr!("Next >"))).on_hover_text(tr!("Next in folder (Alt+Right)")).clicked() {
-                self.open(&ctx, next.unwrap(), None);
+                self.open(&ctx, Source::Path(next.unwrap()), None);
             }
             ui.separator();
             if ui.button(tr!("Fullscreen")).on_hover_text(tr!("Fullscreen (F11)")).clicked() {
@@ -890,14 +988,10 @@ impl RustyPanoApp {
             if let Some(job) = &self.job {
                 let p = job.progress.load(Ordering::Relaxed) as f32 / 1000.0;
                 ui.add(egui::ProgressBar::new(p).desired_width(140.0).desired_height(12.0));
-                ui.label(format!(
-                    "{} {}",
-                    job.stage.lock().unwrap(),
-                    job.path.file_name().map(|s| s.to_string_lossy()).unwrap_or_default()
-                ));
+                ui.label(format!("{} {}", job.stage.lock().unwrap(), job.name));
             } else if let (Some(i), Some(p)) = (self.hovered_hotspot, &self.pano) {
                 let d = &p.hotspots[i].def;
-                let t = if d.description.is_empty() { d.target.display().to_string() } else { d.description.clone() };
+                let t = if d.description.is_empty() { d.target.clone() } else { d.description.clone() };
                 ui.label(tr!("Hotspot: {t}", t = t));
             } else if let Some(p) = &self.pano {
                 ui.label(p.file_name());
@@ -1073,6 +1167,8 @@ impl RustyPanoApp {
                         ui.add_enabled_ui(draft.enable_color_management, |ui| {
                             ui.label(tr!("Display profile"));
                             ui.radio_value(&mut draft.monitor_profile, MonitorProfile::Srgb, tr!("Standard sRGB display"));
+                            // Browsers cannot read local ICC files.
+                            #[cfg(not(target_arch = "wasm32"))]
                             ui.horizontal(|ui| {
                                 ui.radio_value(&mut draft.monitor_profile, MonitorProfile::File, tr!("ICC file:"));
                                 ui.add_enabled(
@@ -1120,6 +1216,7 @@ impl RustyPanoApp {
                             ui.add(egui::DragValue::new(&mut draft.max_gpu_memory_mb).range(256..=65536).suffix(" MB").speed(16));
                         });
                         ui.label(RichText::new(tr!("Larger panoramas are downscaled to fit.")).weak());
+                        #[cfg(not(target_arch = "wasm32"))]
                         ui.checkbox(&mut draft.vsync, tr!("Vertical sync (needs restart)"));
                     }
                 }
@@ -1266,10 +1363,9 @@ impl RustyPanoApp {
             self.metadata = None;
             return;
         };
-        let is_jpeg = p
-            .image_path()
-            .extension()
-            .is_some_and(|e| ["jpg", "jpeg", "jpe"].contains(&e.to_string_lossy().to_lowercase().as_str()));
+        let is_jpeg = ["jpg", "jpeg", "jpe"].contains(&p.loaded.image_source().extension().as_str());
+        // Tags are written back into the file, which needs a local file.
+        let writable = is_jpeg && p.image_path().is_some();
         let mut action = 0;
         egui::Window::new(tr!("Photo Sphere Tags"))
             .collapsible(false)
@@ -1358,10 +1454,12 @@ impl RustyPanoApp {
                 }
                 if !is_jpeg {
                     ui.label(RichText::new(tr!("Writing tags is supported for JPEG files only.")).weak());
+                } else if !writable {
+                    ui.label(RichText::new(tr!("Tags can only be saved into local files in the desktop version.")).weak());
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(is_jpeg || !m.dirty, egui::Button::new(tr!("OK"))).clicked() {
+                    if ui.add_enabled(writable || !m.dirty, egui::Button::new(tr!("OK"))).clicked() {
                         action = 1;
                     }
                     if ui.button(tr!("Cancel")).clicked() {
@@ -1371,10 +1469,13 @@ impl RustyPanoApp {
             });
         match action {
             1 => {
+                #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
                 let m = self.metadata.take().unwrap();
-                if m.dirty {
-                    let path = self.pano.as_ref().unwrap().image_path().to_path_buf();
-                    match xmp::write_gpano_jpeg(&path, &m.tags) {
+                #[cfg(not(target_arch = "wasm32"))]
+                if m.dirty
+                    && let Some(path) = self.pano.as_ref().and_then(|p| p.image_path()).map(Path::to_path_buf)
+                {
+                    match crate::xmp::write_gpano_jpeg(&path, &m.tags) {
                         Ok(()) => {
                             if let Some(p) = &mut self.pano {
                                 p.loaded.gpano = GPano::read(&path);
@@ -1408,7 +1509,10 @@ impl RustyPanoApp {
                     ui.set_min_width(300.0);
                     for (i, h) in p.hotspots.iter().enumerate() {
                         let name = if h.def.description.is_empty() {
-                            h.def.target.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+                            Path::new(&h.def.target.replace('\\', "/"))
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default()
                         } else {
                             h.def.description.clone()
                         };
@@ -1492,6 +1596,11 @@ impl RustyPanoApp {
 impl eframe::App for RustyPanoApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // The browser leaves fullscreen on Esc by itself; follow its state.
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.fullscreen = crate::web::is_fullscreen();
+        }
         self.poll_job(&ctx);
         if self.job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));

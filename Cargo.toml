@@ -6,18 +6,36 @@ license = "MIT"
 
 [dependencies]
 bytemuck = { version = "1.25.2", features = ["derive"] }
-dirs = "7.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
-env_logger = "0.11.11"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "tiff", "png", "webp", "bmp"] }
-jxl-oxide = { version = "0.12.6", features = ["image"] }
 log = "0.4.35"
 qcms = "0.3.0"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
-sys-locale = "0.3.2"
 tiff = "0.11.3"
 toml = "1.2.1"
+web-time = "1.1.0"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dirs = "7.0.0"
+env_logger = "0.11.11"
+jxl-oxide = { version = "0.12.6", features = ["image"] }
+pollster = "0.4"
+sys-locale = "0.3.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# No threads in the browser: decode JPEG XL on the calling thread.
+jxl-oxide = { version = "0.12.6", default-features = false, features = ["image"] }
+js-sys = "0.3.107"
+sys-locale = { version = "0.3.2", features = ["js"] }
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+web-sys = { version = "0.3.107", features = [
+    "Document", "Element", "HtmlCanvasElement", "HtmlElement", "Location", "Response",
+    "Storage", "Url", "UrlSearchParams", "Window",
+] }
+# eframe enables no browser backend on wasm: use WebGPU, fall back to WebGL2.
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "webgpu", "webgl", "wgsl"] }
 
 [profile.release]
 opt-level = 3

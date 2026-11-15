@@ -5,11 +5,11 @@
 //! Reads from JPEG (APP1), TIFF (tag 700) and PNG (iTXt); writes to JPEG.
 
 use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 const XMP_SIG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))] // used for writing (desktop only)
 const GPANO_NS: &str = "http://ns.google.com/photos/1.0/panorama/";
 
 /// Tags the viewer understands, in display order.
@@ -44,9 +44,15 @@ impl GPano {
         self.tags.is_empty()
     }
 
+    /// GPano tags of an image file's contents; `ext` is the lower-case file extension.
+    pub fn from_bytes(data: &[u8], ext: &str) -> GPano {
+        Self::parse(&read_xmp(data, ext).unwrap_or_default())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn read(path: &Path) -> GPano {
-        let xmp = read_xmp(path).unwrap_or_default();
-        Self::parse(&xmp)
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        std::fs::read(path).map(|d| Self::from_bytes(&d, &ext)).unwrap_or_default()
     }
 
     pub fn parse(xmp: &str) -> GPano {
@@ -77,99 +83,83 @@ impl GPano {
     }
 }
 
-fn read_xmp(path: &Path) -> Option<String> {
-    let ext = path.extension()?.to_string_lossy().to_lowercase();
-    match ext.as_str() {
-        "jpg" | "jpeg" | "jpe" => read_jpeg_xmp(path),
+fn read_xmp(data: &[u8], ext: &str) -> Option<String> {
+    match ext {
+        "jpg" | "jpeg" | "jpe" => read_jpeg_xmp(data),
         "tif" | "tiff" => {
-            let f = BufReader::new(File::open(path).ok()?);
-            let mut d = tiff::decoder::Decoder::new(f).ok()?;
+            let mut d = tiff::decoder::Decoder::new(std::io::Cursor::new(data)).ok()?;
             let v = d.get_tag_u8_vec(tiff::tags::Tag::Unknown(700)).ok()?;
             Some(String::from_utf8_lossy(&v).into_owned())
         }
-        "png" => read_png_xmp(path),
+        "png" => read_png_xmp(data),
         // WebP (RIFF "XMP " chunk) and JPEG XL ("xml " box) store the packet
         // uncompressed in most files: scan for it.
-        "webp" | "jxl" => scan_xmp(path),
+        "webp" | "jxl" => scan_xmp(data),
         _ => None,
     }
 }
 
-fn scan_xmp(path: &Path) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
+fn scan_xmp(data: &[u8]) -> Option<String> {
     let start = data.windows(10).position(|w| w == b"<x:xmpmeta")?;
     let end_tag = b"</x:xmpmeta>";
     let len = data[start..].windows(end_tag.len()).position(|w| w == end_tag)? + end_tag.len();
     Some(String::from_utf8_lossy(&data[start..start + len]).into_owned())
 }
 
-fn read_jpeg_xmp(path: &Path) -> Option<String> {
-    let mut f = BufReader::new(File::open(path).ok()?);
-    let mut b2 = [0u8; 2];
-    f.read_exact(&mut b2).ok()?;
-    if b2 != [0xFF, 0xD8] {
+fn read_jpeg_xmp(data: &[u8]) -> Option<String> {
+    if !data.starts_with(&[0xFF, 0xD8]) {
         return None;
     }
-    loop {
-        f.read_exact(&mut b2).ok()?;
-        if b2[0] != 0xFF {
+    let mut pos = 2;
+    while pos + 4 <= data.len() {
+        if data[pos] != 0xFF {
             return None;
         }
-        let marker = b2[1];
+        let marker = data[pos + 1];
         if marker == 0xD9 || marker == 0xDA {
             return None;
         }
         if (0xD0..=0xD7).contains(&marker) || marker == 0x01 || marker == 0xFF {
+            pos += if marker == 0xFF { 1 } else { 2 };
             continue;
         }
-        f.read_exact(&mut b2).ok()?;
-        let len = u16::from_be_bytes(b2) as usize;
-        if len < 2 {
+        let len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        if len < 2 || pos + 2 + len > data.len() {
             return None;
         }
-        if marker == 0xE1 {
-            let mut data = vec![0u8; len - 2];
-            f.read_exact(&mut data).ok()?;
-            if data.starts_with(XMP_SIG) {
-                return Some(String::from_utf8_lossy(&data[XMP_SIG.len()..]).into_owned());
-            }
-        } else {
-            f.seek(SeekFrom::Current(len as i64 - 2)).ok()?;
+        let payload = &data[pos + 4..pos + 2 + len];
+        if marker == 0xE1 && payload.starts_with(XMP_SIG) {
+            return Some(String::from_utf8_lossy(&payload[XMP_SIG.len()..]).into_owned());
         }
+        pos += 2 + len;
     }
+    None
 }
 
-fn read_png_xmp(path: &Path) -> Option<String> {
-    let mut f = BufReader::new(File::open(path).ok()?);
-    let mut sig = [0u8; 8];
-    f.read_exact(&mut sig).ok()?;
-    loop {
-        let mut hdr = [0u8; 8];
-        f.read_exact(&mut hdr).ok()?;
-        let len = u32::from_be_bytes(hdr[0..4].try_into().ok()?) as usize;
-        let ty = &hdr[4..8];
+fn read_png_xmp(data: &[u8]) -> Option<String> {
+    let mut pos = 8;
+    while pos + 8 <= data.len() {
+        let len = u32::from_be_bytes(data[pos..pos + 4].try_into().ok()?) as usize;
+        let ty = &data[pos + 4..pos + 8];
         if ty == b"IDAT" || ty == b"IEND" {
             return None;
         }
-        if ty == b"iTXt" {
-            let mut data = vec![0u8; len];
-            f.read_exact(&mut data).ok()?;
-            if data.starts_with(b"XML:com.adobe.xmp\0") {
-                // keyword\0 compression_flag compression_method lang\0 translated\0 text
-                let mut p = 18 + 2;
-                for _ in 0..2 {
-                    p += data[p..].iter().position(|&b| b == 0)? + 1;
-                }
-                return Some(String::from_utf8_lossy(&data[p..]).into_owned());
+        let body = data.get(pos + 8..pos + 8 + len)?;
+        if ty == b"iTXt" && body.starts_with(b"XML:com.adobe.xmp\0") {
+            // keyword\0 compression_flag compression_method lang\0 translated\0 text
+            let mut p = 18 + 2;
+            for _ in 0..2 {
+                p += body[p..].iter().position(|&b| b == 0)? + 1;
             }
-            f.seek(SeekFrom::Current(4)).ok()?;
-        } else {
-            f.seek(SeekFrom::Current(len as i64 + 4)).ok()?;
+            return Some(String::from_utf8_lossy(&body[p..]).into_owned());
         }
+        pos += 12 + len;
     }
+    None
 }
 
 /// Set one GPano property inside an XMP packet, creating it if missing.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn set_in_xmp(xmp: &mut String, name: &str, value: &str) {
     let attr = format!("GPano:{name}=\"");
     if let Some(i) = xmp.find(&attr) {
@@ -192,6 +182,7 @@ fn set_in_xmp(xmp: &mut String, name: &str, value: &str) {
     }
 }
 
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 fn ensure_packet(xmp: &str) -> String {
     let mut s = if xmp.contains("<rdf:Description") {
         xmp.to_string()
@@ -210,6 +201,7 @@ fn ensure_packet(xmp: &str) -> String {
 }
 
 /// Rewrite the JPEG at `path` with the given GPano tags merged into its XMP.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write_gpano_jpeg(path: &Path, tags: &GPano) -> Result<(), String> {
     let data = std::fs::read(path).map_err(|e| e.to_string())?;
     if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
@@ -274,7 +266,8 @@ pub fn write_gpano_jpeg(path: &Path, tags: &GPano) -> Result<(), String> {
     }
     let tmp = path.with_extension("rustypano-tmp");
     {
-        let mut f = File::create(&tmp).map_err(|e| e.to_string())?;
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
         f.write_all(&out).map_err(|e| e.to_string())?;
         f.sync_all().ok();
     }
@@ -317,7 +310,7 @@ mod tests {
         assert_eq!(GPano::read(&f).get("CroppedAreaTopPixels"), Some(4.0));
         let img = image::open(&f).unwrap();
         assert_eq!((img.width(), img.height()), (64, 32));
-        let p = crate::fsv::PanoParams::from_image(&f, &GPano::read(&f));
+        let p = crate::fsv::PanoParams::from_image(crate::source::Source::Path(f.clone()), &GPano::read(&f));
         assert_eq!(p.yaw, Some(225.0)); // 180 - pose(0) + 45
     }
 

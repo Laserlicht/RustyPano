@@ -123,9 +123,48 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  web:
+    name: Web (WebAssembly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - name: Install wasm-bindgen-cli and wasm-opt
+        run: |
+          version="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+          cargo install wasm-bindgen-cli --version "$version" --locked
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binaryen
+
+      - name: Read version
+        id: version
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: packaging/web/build-web.sh dist/web
+
+      - name: Package
+        run: |
+          mkdir -p dist/out
+          (cd dist/web && zip -r "../out/RustyPano-${{ steps.version.outputs.version }}-web.zip" .)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustyPano-web
+          path: dist/out/*
+          if-no-files-found: error
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, web]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

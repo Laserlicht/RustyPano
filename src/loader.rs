@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 RustyPano contributors
 
-//! Background loading: decode → colour-manage → split into GPU tiles with
+//! Loading: read → decode → colour-manage → split into GPU tiles with
 //! gutters → build mipmaps → upload into one `texture_2d_array`.
 //!
 //! Panoramas are usually far bigger than the GPU's maximum texture size, so the
@@ -10,23 +10,32 @@
 //! pixels. The gutter holds real neighbouring pixels (wrapping horizontally,
 //! clamped vertically), so filtering never shows seams up to mip level
 //! `MAX_LOD`.
+//!
+//! The pipeline is one async function. Natively it runs on a background thread
+//! (and uses worker threads for the heavy parts); in the browser it runs on the
+//! main thread and yields between steps so the page stays responsive.
 
-use std::path::{Path, PathBuf};
+use std::io::Cursor;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Instant;
 
 use eframe::wgpu;
 use image::{ImageDecoder, ImageReader};
+use web_time::Instant;
 
-use crate::fsv::PanoParams;
+use crate::fsv::{PanoParams, decode_text};
 use crate::settings::{MonitorProfile, Settings};
+use crate::source::Source;
 use crate::xmp::GPano;
 
 pub const GUTTER: u32 = 32;
 pub const MIP_LEVELS: u32 = 6; // levels 0..=5; gutter is 1 texel at level 5
 pub const MAX_LOD: u32 = MIP_LEVELS - 1;
 const MAX_TILE: u32 = 4096;
+/// The browser build has a 4 GB address space; refuse images that cannot fit.
+#[cfg(target_arch = "wasm32")]
+const MAX_WEB_PIXELS: u64 = 300_000_000;
 
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
@@ -44,7 +53,8 @@ pub struct GpuPano {
 }
 
 pub struct LoadedPano {
-    pub source: PathBuf,
+    /// What was opened: the image itself or the tour file.
+    pub source: Source,
     pub params: PanoParams,
     pub gpano: GPano,
     pub width: u32,
@@ -55,6 +65,13 @@ pub struct LoadedPano {
     pub load_time: f32,
 }
 
+impl LoadedPano {
+    /// The displayed image (for a tour, the image it points to).
+    pub fn image_source(&self) -> &Source {
+        self.params.image.as_ref().unwrap_or(&self.source)
+    }
+}
+
 #[derive(Clone)]
 pub struct Overrides {
     pub yaw: Option<f64>,
@@ -63,7 +80,7 @@ pub struct Overrides {
 }
 
 pub struct LoadJob {
-    pub path: PathBuf,
+    pub name: String,
     pub progress: Arc<AtomicU32>, // 0..=1000
     pub stage: Arc<Mutex<String>>,
     pub cancel: Arc<AtomicBool>,
@@ -72,7 +89,7 @@ pub struct LoadJob {
 }
 
 pub fn start_load(
-    path: PathBuf,
+    source: Source,
     settings: &Settings,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -84,72 +101,104 @@ pub fn start_load(
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let s = settings.clone();
-    let (p2, st2, c2, path2) = (progress.clone(), stage.clone(), cancel.clone(), path.clone());
+    let name = source.file_name();
+    let (p2, st2, c2) = (progress.clone(), stage.clone(), cancel.clone());
+    let job = async move {
+        let r = load(&source, &s, &device, &queue, &p2, &st2, &c2, &ctx).await;
+        let _ = tx.send(r);
+        ctx.request_repaint();
+    };
+    #[cfg(not(target_arch = "wasm32"))]
     std::thread::Builder::new()
         .name("pano-loader".into())
-        .spawn(move || {
-            let r = load(&path2, &s, &device, &queue, &p2, &st2, &c2, &ctx);
-            let _ = tx.send(r);
-            ctx.request_repaint();
-        })
+        .spawn(move || pollster::block_on(job))
         .expect("spawn loader thread");
-    LoadJob { path, progress, stage, cancel, rx, overrides }
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(job);
+    LoadJob { name, progress, stage, cancel, rx, overrides }
 }
 
 /// Image file extensions the viewer opens (lower case).
 pub const IMAGE_EXTENSIONS: &[&str] =
     &["jpg", "jpeg", "jpe", "tif", "tiff", "png", "webp", "bmp", "jxl"];
 
+pub fn is_supported_ext(ext: &str) -> bool {
+    ext == "fsv" || IMAGE_EXTENSIONS.contains(&ext)
+}
+
 pub fn is_supported(path: &Path) -> bool {
-    path.extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .is_some_and(|e| e == "fsv" || IMAGE_EXTENSIONS.contains(&e.as_str()))
+    path.extension().is_some_and(|e| is_supported_ext(&e.to_string_lossy().to_lowercase()))
 }
 
-/// Container formats recognised from the first bytes of the file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Sniffed {
-    Jxl,
-    Other,
+/// Let other work run (browser only; native loading has its own thread).
+async fn yield_now() {
+    #[cfg(target_arch = "wasm32")]
+    crate::web::yield_now().await;
 }
 
-fn sniff(path: &Path) -> Sniffed {
-    let mut head = [0u8; 12];
-    let n = std::fs::File::open(path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
-    let head = &head[..n];
-    if head.starts_with(&[0xFF, 0x0A]) || head.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
-        Sniffed::Jxl
-    } else {
-        Sniffed::Other
+/// Run `f` over chunks of `data` in parallel where threads are available.
+fn par_chunks(data: &mut [u8], chunk: usize, f: impl Fn(&mut [u8]) + Sync) {
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::scope(|s| {
+        for c in data.chunks_mut(chunk) {
+            let f = &f;
+            s.spawn(move || f(c));
+        }
+    });
+    #[cfg(target_arch = "wasm32")]
+    for c in data.chunks_mut(chunk) {
+        f(c);
     }
 }
 
+fn threads() -> usize {
+    #[cfg(not(target_arch = "wasm32"))]
+    return std::thread::available_parallelism().map_or(4, |n| n.get());
+    #[cfg(target_arch = "wasm32")]
+    1
+}
+
+fn is_jxl(data: &[u8]) -> bool {
+    data.starts_with(&[0xFF, 0x0A]) || data.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n")
+}
+
+fn check_size(_w: u32, _h: u32) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    if _w as u64 * _h as u64 > MAX_WEB_PIXELS {
+        return Err(tr!(
+            "This panorama ({w}×{h}) is too large for the browser version.",
+            w = _w,
+            h = _h
+        ));
+    }
+    Ok(())
+}
+
 /// Decode any supported image, returning the pixels and the embedded ICC profile.
-fn decode(path: &Path) -> Result<(image::DynamicImage, Option<Vec<u8>>), String> {
+fn decode(data: &[u8]) -> Result<(image::DynamicImage, Option<Vec<u8>>), String> {
     let err = |e: &dyn std::fmt::Display| tr!("Cannot decode this image: {error}", error = e);
-    match sniff(path) {
-        Sniffed::Jxl => {
-            let f = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
-            let mut decoder = jxl_oxide::integration::JxlDecoder::new(f).map_err(|e| err(&e))?;
-            let icc = decoder.icc_profile().ok().flatten();
-            let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
-            Ok((img, icc))
-        }
-        Sniffed::Other => {
-            let mut reader = ImageReader::open(path).map_err(|e| e.to_string())?;
-            reader = reader.with_guessed_format().map_err(|e| e.to_string())?;
-            reader.no_limits();
-            let mut decoder = reader.into_decoder().map_err(|e| err(&e))?;
-            let icc = decoder.icc_profile().ok().flatten();
-            let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
-            Ok((img, icc))
-        }
+    if is_jxl(data) {
+        let mut decoder = jxl_oxide::integration::JxlDecoder::new(Cursor::new(data)).map_err(|e| err(&e))?;
+        let (w, h) = decoder.dimensions();
+        check_size(w, h)?;
+        let icc = decoder.icc_profile().ok().flatten();
+        let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
+        Ok((img, icc))
+    } else {
+        let mut reader = ImageReader::new(Cursor::new(data)).with_guessed_format().map_err(|e| e.to_string())?;
+        reader.no_limits();
+        let mut decoder = reader.into_decoder().map_err(|e| err(&e))?;
+        let (w, h) = decoder.dimensions();
+        check_size(w, h)?;
+        let icc = decoder.icc_profile().ok().flatten();
+        let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
+        Ok((img, icc))
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load(
-    path: &Path,
+async fn load(
+    source: &Source,
     settings: &Settings,
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -163,23 +212,29 @@ fn load(
         *stage.lock().unwrap() = s.to_string();
         ctx.request_repaint();
     };
-    if !path.exists() {
-        return Err(tr!("No such file: {path}", path = path.display()));
+    let cancelled = || cancel.load(Ordering::Relaxed);
+
+    let (mut params, image_source, data) = if source.is_fsv() {
+        let text = decode_text(&source.read().await?);
+        let mut params = PanoParams::parse_fsv(&text)?;
+        let image = source.resolve(&params.image_name)?;
+        let data = image.read().await?;
+        params.image = Some(image.clone());
+        (params, image, data)
+    } else {
+        (PanoParams::default(), source.clone(), source.read().await?)
+    };
+    let gpano = GPano::from_bytes(&data, &image_source.extension());
+    if !source.is_fsv() {
+        params = PanoParams::from_image(image_source, &gpano);
     }
-    let is_fsv = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("fsv"));
-    let mut params = if is_fsv { PanoParams::read_fsv(path)? } else { PanoParams::default() };
-    let image_path = if is_fsv { params.image.clone() } else { path.to_path_buf() };
-    if !image_path.exists() {
-        return Err(tr!("No such file: {path}", path = image_path.display()));
-    }
-    let gpano = GPano::read(&image_path);
-    if !is_fsv {
-        params = PanoParams::from_image(&image_path, &gpano);
-    }
+    progress.store(50, Ordering::Relaxed);
 
     set_stage(tr!("Decoding"));
-    let (img, icc) = decode(&image_path)?;
-    if cancel.load(Ordering::Relaxed) {
+    yield_now().await;
+    let (img, icc) = decode(&data)?;
+    drop(data);
+    if cancelled() {
         return Err("cancelled".into());
     }
     let (width, height) = (img.width(), img.height());
@@ -190,9 +245,12 @@ fn load(
     let mut icc_used = None;
     if settings.enable_color_management {
         set_stage(tr!("Colour management"));
+        yield_now().await;
         let output = match settings.monitor_profile {
             MonitorProfile::File if !settings.monitor_profile_file.is_empty() => {
-                qcms::Profile::new_from_path(&settings.monitor_profile_file)
+                std::fs::read(&settings.monitor_profile_file)
+                    .ok()
+                    .and_then(|b| qcms::Profile::new_from_slice(&b, false))
             }
             _ => None,
         };
@@ -205,16 +263,9 @@ fn load(
             if let Some(xf) =
                 qcms::Transform::new(&input, &output, qcms::DataType::RGB8, qcms::Intent::Perceptual)
             {
-                let buf: &mut [u8] = &mut rgb;
-                let n = std::thread::available_parallelism().map_or(4, |n| n.get());
                 let row = width as usize * 3;
-                let rows_per = (height as usize).div_ceil(n).max(1);
-                std::thread::scope(|s| {
-                    for chunk in buf.chunks_mut(rows_per * row) {
-                        let xf = &xf;
-                        s.spawn(move || xf.apply(chunk));
-                    }
-                });
+                let rows_per = (height as usize).div_ceil(threads()).max(1);
+                par_chunks(&mut rgb, rows_per * row, |c| xf.apply(c));
                 icc_used = Some(if icc.is_some() { tr!("embedded ICC").into() } else { tr!("sRGB (assumed)").into() });
             }
         }
@@ -233,14 +284,15 @@ fn load(
         let bytes = layout.tile_size as u64 * layout.tile_size as u64 * 4 * 4 / 3 * layout.layers() as u64;
         if (layout.layers() > max_layers || bytes > budget) && gw >= 1024 {
             set_stage(tr!("Downscaling"));
+            yield_now().await;
             rgb = halve(&rgb);
             downscale *= 2;
             (gw, gh) = (rgb.width(), rgb.height());
             continue;
         }
         set_stage(tr!("Uploading to GPU"));
-        let tex = upload(&rgb, &layout, device, queue, progress, cancel, ctx);
-        if cancel.load(Ordering::Relaxed) {
+        let tex = upload(&rgb, &layout, device, queue, progress, cancel, ctx).await;
+        if cancelled() {
             return Err("cancelled".into());
         }
         if verify(&tex, &rgb, &layout, device, queue) || gw < 1024 {
@@ -277,7 +329,7 @@ fn load(
         tiles_y: layout.tiles_y,
     });
     Ok(LoadedPano {
-        source: path.to_path_buf(),
+        source: source.clone(),
         params,
         gpano,
         width,
@@ -293,7 +345,32 @@ fn mip_levels_for(layout: &TileLayout) -> u32 {
     MIP_LEVELS.min(32 - layout.tile_size.leading_zeros())
 }
 
-fn upload(
+/// Build one tile with its mip chain and copy it into the texture layer.
+fn upload_tile(rgb: &image::RgbImage, layout: &TileLayout, layer: u32, texture: &wgpu::Texture, queue: &wgpu::Queue, lut: &Lut) {
+    let mip_levels = mip_levels_for(layout);
+    let (tx, ty) = (layer % layout.tiles_x, layer / layout.tiles_x);
+    let mut level = build_tile(rgb, rgb.width(), rgb.height(), layout, tx, ty);
+    let mut size = layout.tile_size;
+    for mip in 0..mip_levels {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: mip,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &level,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        );
+        if mip + 1 < mip_levels {
+            level = downsample_rgba(&level, size, lut);
+            size /= 2;
+        }
+    }
+}
+
+async fn upload(
     rgb: &image::RgbImage,
     layout: &TileLayout,
     device: &wgpu::Device,
@@ -302,8 +379,6 @@ fn upload(
     cancel: &AtomicBool,
     ctx: &eframe::egui::Context,
 ) -> wgpu::Texture {
-    let (gw, gh) = (rgb.width(), rgb.height());
-    let mip_levels = mip_levels_for(layout);
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("pano tiles"),
         size: wgpu::Extent3d {
@@ -311,7 +386,7 @@ fn upload(
             height: layout.tile_size,
             depth_or_array_layers: layout.layers(),
         },
-        mip_level_count: mip_levels,
+        mip_level_count: mip_levels_for(layout),
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -321,58 +396,54 @@ fn upload(
 
     let lut = Lut::new();
     let n_tiles = layout.tiles_x * layout.tiles_y;
-    let done = AtomicU32::new(0);
-    let next = AtomicU32::new(0);
-    // Each worker holds one tile (+ mips) at a time: ~90 MB at 4096².
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(n_tiles as usize).clamp(1, 8);
-    std::thread::scope(|s| {
-        for _ in 0..threads {
-            s.spawn(|| {
-                loop {
-                    if cancel.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    let layer = next.fetch_add(1, Ordering::Relaxed);
-                    if layer >= n_tiles {
-                        return;
-                    }
-                    let tx = layer % layout.tiles_x;
-                    let ty = layer / layout.tiles_x;
-                    let mut level = build_tile(rgb, gw, gh, layout, tx, ty);
-                    let mut size = layout.tile_size;
-                    for mip in 0..mip_levels {
-                        queue.write_texture(
-                            wgpu::TexelCopyTextureInfo {
-                                texture: &texture,
-                                mip_level: mip,
-                                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
-                                aspect: wgpu::TextureAspect::All,
-                            },
-                            &level,
-                            wgpu::TexelCopyBufferLayout {
-                                offset: 0,
-                                bytes_per_row: Some(size * 4),
-                                rows_per_image: Some(size),
-                            },
-                            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-                        );
-                        if mip + 1 < mip_levels {
-                            level = downsample_rgba(&level, size, &lut);
-                            size /= 2;
+    let report = |done: u32| {
+        progress.store(250 + 750 * done / n_tiles, Ordering::Relaxed);
+        ctx.request_repaint();
+    };
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let done = AtomicU32::new(0);
+        let next = AtomicU32::new(0);
+        // Each worker holds one tile (+ mips) at a time: ~90 MB at 4096².
+        let workers = threads().min(n_tiles as usize).clamp(1, 8);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| {
+                    while !cancel.load(Ordering::Relaxed) {
+                        let layer = next.fetch_add(1, Ordering::Relaxed);
+                        if layer >= n_tiles {
+                            return;
                         }
+                        upload_tile(rgb, layout, layer, &texture, queue, &lut);
+                        report(done.fetch_add(1, Ordering::Relaxed) + 1);
                     }
-                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                    progress.store(250 + 750 * d / n_tiles, Ordering::Relaxed);
-                    ctx.request_repaint();
-                }
-            });
+                });
+            }
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    for layer in 0..n_tiles {
+        if cancel.load(Ordering::Relaxed) {
+            break;
         }
-    });
+        upload_tile(rgb, layout, layer, &texture, queue, &lut);
+        report(layer + 1);
+        yield_now().await;
+    }
     queue.submit([]);
     texture
 }
 
+/// The browser cannot wait for a GPU readback; WebGPU reports allocation
+/// failures itself, so the check is skipped there.
+#[cfg(target_arch = "wasm32")]
+fn verify(_: &wgpu::Texture, _: &image::RgbImage, _: &TileLayout, _: &wgpu::Device, _: &wgpu::Queue) -> bool {
+    true
+}
+
 /// Read back a few texels of the last tile and compare them with the source.
+#[cfg(not(target_arch = "wasm32"))]
 fn verify(
     tex: &wgpu::Texture,
     rgb: &image::RgbImage,
