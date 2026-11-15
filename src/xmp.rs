@@ -49,10 +49,32 @@ impl GPano {
         Self::parse(&read_xmp(data, ext).unwrap_or_default())
     }
 
+    /// GPano tags of a local file, reading only the parts that can hold XMP
+    /// (panoramas can be many gigabytes).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn read(path: &Path) -> GPano {
+        use std::io::{Read, Seek, SeekFrom};
         let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        std::fs::read(path).map(|d| Self::from_bytes(&d, &ext)).unwrap_or_default()
+        let Ok(mut f) = std::fs::File::open(path) else { return GPano::default() };
+        if ext == "tif" || ext == "tiff" {
+            let Ok(mut d) = tiff::decoder::Decoder::new(std::io::BufReader::new(f)) else { return GPano::default() };
+            let v = d.get_tag_u8_vec(tiff::tags::Tag::Unknown(700)).unwrap_or_default();
+            return Self::parse(&String::from_utf8_lossy(&v));
+        }
+        // JPEG and PNG keep XMP near the start; WebP and JPEG XL often at the end.
+        const PART: u64 = 16 << 20;
+        let len = f.metadata().map_or(0, |m| m.len());
+        let mut data = Vec::new();
+        let _ = (&mut f).take(PART).read_to_end(&mut data);
+        let read_rest = if len > 2 * PART {
+            matches!(ext.as_str(), "webp" | "jxl") && f.seek(SeekFrom::End(-(PART as i64))).is_ok()
+        } else {
+            len > PART
+        };
+        if read_rest {
+            let _ = f.read_to_end(&mut data);
+        }
+        Self::from_bytes(&data, &ext)
     }
 
     pub fn parse(xmp: &str) -> GPano {

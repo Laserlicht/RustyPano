@@ -64,9 +64,13 @@ Opening panoramas in the browser:
   resolved relative to the tour's URL. `yaw`, `pitch`, `hfov` and `fs=1` set the
   initial view and fullscreen.
 
-Settings are kept in the browser's local storage. Not available in the
+Settings are kept in the browser's local storage and tiles in its Cache
+Storage (per tab, deleted when the tab is closed; anything a closed tab could
+not delete in time is removed the next time the page is opened). Not available in the
 browser: previous/next image in folder, recent files, saving Photo Sphere tags
-into files, display ICC profiles from files, and panoramas above 300 megapixels.
+into files and display ICC profiles from files. Size limits in the browser:
+300 megapixels for JPEG and WebP (decoded as a whole), 2 gigapixels for PNG,
+TIFF, JPEG XL and BMP (read in stripes).
 
 ## Controls
 
@@ -102,6 +106,12 @@ with adjustable speed).
 - Colour management (qcms): embedded ICC → sRGB or a display ICC file.
 - Filtering: nearest, trilinear (mipmapped), bicubic, Lanczos3, chosen
   separately for a still view and while moving.
+- Tile cache: the tiles of opened panoramas are stored instead of keeping the
+  image in memory (on disk under `~/.cache/rustypano/tiles`, in the browser in
+  Cache Storage); opening a panorama again in the same session is instant. The
+  cache belongs to the running app and is deleted when it closes; leftovers of
+  crashed sessions are removed on the next start. Size limit and "Clear" under
+  Settings → System (default 10 GB, 4 GB in the browser).
 - Recent files, settings in `~/.config/rustypano/settings.toml`.
 - English and German UI. The language follows the system (`LANGUAGE`,
   `LC_ALL`, `LC_MESSAGES`, `LANG` on Linux) and can be changed under
@@ -109,33 +119,43 @@ with adjustable speed).
 
 ## How rendering works
 
-Panoramas are streamed in multiple resolutions, so GPU memory depends on the
-screen, not on the image size:
+Panoramas are shown in multiple resolutions from a tile cache, so neither the
+GPU nor main memory has to hold the whole image:
 
-- `src/loader.rs` decodes (on a background thread natively), applies the ICC
-  transform and builds a **resolution pyramid** on the CPU: full size, half,
-  quarter, … (gamma-correct 2× downscaling).
-- `src/tiles.rs` cuts every level into tiles. The tile width and height are
-  chosen per image (multiples of 32 between 512 and 1024 px) so the finest
-  levels divide almost evenly, e.g. 672×1024 for 20000×10000.
-- On the GPU there is only a **tile cache**: a `texture_2d_array` whose layers
-  ("slots") hold one tile each, with a 32 px gutter of real neighbouring pixels
-  and 6 gamma-correct mip levels, plus a small **page table** texture mapping
-  (level, tile) → slot. The coarsest level is always resident.
-- Every frame the visible tiles at the resolution the screen needs are worked
-  out on the CPU; missing ones are built by worker threads (in the browser:
-  within ~8 ms per frame) and the least recently used tiles are evicted.
-- `src/pano.wgsl` casts a ray per screen pixel, converts it to longitude/
-  latitude, picks the pyramid level from screen-space derivatives, looks the
-  tile up in the page table (falling back to coarser levels while finer tiles
-  stream in) and samples with the selected kernel. The grid overlay is drawn
-  analytically in the same pass.
+- **Reading** (`src/pyramid.rs`): PNG, TIFF (strips or tiles), JPEG XL and BMP
+  are decoded stripe by stripe. JPEG and WebP decoders can only produce the
+  whole image; it is handed on row by row and freed right afterwards.
+- **Building tiles:** each stripe is colour-managed (ICC → sRGB or display
+  profile) and fed into a streaming pyramid builder. For every level (full
+  size, half, quarter, …; gamma-correct 2× downscaling) it keeps only a band of
+  about one tile row and emits tiles as soon as their rows are complete. Tile
+  width and height are chosen per image (multiples of 32 between 512 and
+  1024 px) so the finest levels divide almost evenly; every tile carries a
+  32 px gutter of real neighbouring pixels (wrapping horizontally).
+- **Tile cache** (`src/store.rs`): tiles are stored as JPEG (quality 92, 4:4:4)
+  on disk or in the browser's Cache Storage, keyed by the file's identity and
+  the colour settings, in a directory (or set of caches) belonging to the
+  running app. Opening the same panorama again in the session does not decode
+  the image at all; the least recently used panoramas are removed when the size
+  limit is reached, and everything is deleted when the app closes. Each running
+  app signals once a minute that it is alive, so a new start only removes
+  caches of sessions that are gone. `RUSTYPANO_CACHE_DIR` overrides the
+  location.
+- **GPU cache** (`src/tiles.rs`): a `texture_2d_array` whose layers ("slots")
+  hold one tile each with 6 gamma-correct mip levels, plus a page table
+  texture mapping (level, tile) → slot. The coarsest level is always resident.
+  Every frame the visible tiles at the needed resolution are worked out on the
+  CPU, missing ones are loaded from the tile cache (by worker threads; in the
+  browser asynchronously) and the least recently used ones are evicted.
+- **Shader** (`src/pano.wgsl`): casts a ray per screen pixel, converts it to
+  longitude/latitude, picks the pyramid level from screen-space derivatives,
+  looks the tile up in the page table (falling back to coarser levels while
+  finer tiles stream in) and samples with the selected kernel. The grid
+  overlay is drawn analytically in the same pass.
 
-The cache size is set under Settings → System → GPU tile cache (default 768 MB,
-384 MB in the browser; a 4K screen needs well under 200 MB). Some OpenGL drivers
-fail silently when video memory runs out, so the cache is verified after
-allocation and made smaller if needed. The full image stays in main memory
-(about 4 bytes per pixel including the pyramid).
+The GPU cache size is set under Settings → System (default 768 MB, 384 MB in the
+browser). Some OpenGL drivers fail silently when video memory runs out, so the
+cache is verified after allocation and made smaller if needed.
 
 ## Translations
 
@@ -160,8 +180,10 @@ catalog file.
 | `src/main.rs` | command line, window and wgpu device setup |
 | `src/app.rs` | UI, menus, toolbar, status bar, dialogs, input handling |
 | `src/view.rs` | view state, limits, projection maths (shared with picking) |
-| `src/loader.rs` | read, decode, colour management, pyramid, cache setup |
-| `src/tiles.rs` | tile grid, pyramid, GPU tile cache, streaming, visibility |
+| `src/loader.rs` | load pipeline: cache lookup, building tiles, GPU cache setup |
+| `src/pyramid.rs` | stripe-wise image reading, streaming pyramid builder |
+| `src/store.rs` | persistent tile cache (disk, browser Cache Storage, memory) |
+| `src/tiles.rs` | tile grid, GPU tile cache, streaming, visibility |
 | `src/render.rs`, `src/pano.wgsl` | wgpu pipeline and shader |
 | `src/fsv.rs` | `.fsv` parser and GPano → view parameters |
 | `src/xmp.rs` | GPano XMP read (JPEG/TIFF/PNG) and write (JPEG) |
@@ -178,3 +200,6 @@ Debug aids: `RUSTYPANO_SCREENSHOT=out.png` saves one rendered frame and quits;
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+Cached tiles are encoded with the `jpeg-encoder` crate, which is based in part
+on the work of the Independent JPEG Group.

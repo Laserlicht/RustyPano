@@ -1,32 +1,37 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 RustyPano contributors
 
-//! Loading: read → decode → colour-manage → build the resolution pyramid →
-//! allocate the GPU tile cache and upload the coarsest level. Finer tiles are
-//! streamed in while viewing (see `tiles.rs`).
+//! Loading a panorama.
 //!
-//! The pipeline is one async function. Natively it runs on a background thread
-//! (and uses worker threads for the heavy parts); in the browser it runs on the
-//! main thread and yields between steps so the page stays responsive.
+//! 1. Work out a cache key from the file's identity and the colour settings.
+//! 2. If the tile store has the panorama, use it: the original file is not
+//!    read at all.
+//! 3. Otherwise read the image in stripes (`pyramid.rs`), colour-manage each
+//!    stripe, cut all pyramid levels into tiles and store them as JPEG
+//!    (`store.rs`). The decoded image is never kept as a whole (except for
+//!    formats whose decoders can only produce the whole image).
+//! 4. Allocate the GPU tile cache and upload the coarsest level; finer tiles
+//!    are streamed in while viewing (`tiles.rs`).
+//!
+//! Natively this runs on a background thread (with worker threads for
+//! encoding); in the browser it runs on the main thread and yields regularly
+//! so the page stays responsive.
 
-use std::io::Cursor;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use eframe::wgpu;
-use image::{ImageDecoder, ImageReader};
 use web_time::Instant;
 
 use crate::fsv::{PanoParams, decode_text};
+use crate::pyramid::{Input, PyramidBuilder, ReadSeek, open_rows};
 use crate::settings::{MonitorProfile, Settings};
 use crate::source::Source;
-use crate::tiles::{GpuTiles, Lut, Pyramid, TileCache, TileGrid};
+use crate::store::{self, CacheMeta, FORMAT_VERSION, TileStore};
+use crate::tiles::{GpuTiles, Lut, TileCache, TileGrid, TileId, slot_mips};
 use crate::xmp::GPano;
-
-/// The browser build has a 4 GB address space; refuse images that cannot fit.
-#[cfg(target_arch = "wasm32")]
-const MAX_WEB_PIXELS: u64 = 300_000_000;
 
 pub struct LoadedPano {
     /// What was opened: the image itself or the tour file.
@@ -35,10 +40,12 @@ pub struct LoadedPano {
     pub gpano: GPano,
     pub width: u32,
     pub height: u32,
-    /// Multi-resolution tiles: CPU pyramid plus the GPU cache.
+    /// Multi-resolution tiles: tile store plus the GPU cache.
     pub tiles: TileCache,
     pub icc_used: Option<String>,
     pub load_time: f32,
+    /// The tiles came from the tile cache (the image was not decoded).
+    pub from_cache: bool,
 }
 
 impl LoadedPano {
@@ -79,7 +86,8 @@ pub fn start_load(
     let s = settings.clone();
     let name = source.file_name();
     let (p2, st2, c2) = (progress.clone(), stage.clone(), cancel.clone());
-    let job = async move {
+    // The future is created on the thread that runs it, so it need not be Send.
+    let run = move || async move {
         let r = load(&source, &s, &device, &queue, &p2, &st2, &c2, &ctx).await;
         let _ = tx.send(r);
         ctx.request_repaint();
@@ -87,10 +95,10 @@ pub fn start_load(
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::Builder::new()
         .name("pano-loader".into())
-        .spawn(move || pollster::block_on(job))
+        .spawn(move || pollster::block_on(run()))
         .expect("spawn loader thread");
     #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(job);
+    wasm_bindgen_futures::spawn_local(run());
     LoadJob { name, progress, stage, cancel, rx, overrides }
 }
 
@@ -135,43 +143,50 @@ pub(crate) fn threads() -> usize {
     1
 }
 
-fn is_jxl(data: &[u8]) -> bool {
-    data.starts_with(&[0xFF, 0x0A]) || data.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n")
-}
+// ---------------------------------------------------------------------------
+// Cache key
 
-fn check_size(_w: u32, _h: u32) -> Result<(), String> {
-    #[cfg(target_arch = "wasm32")]
-    if _w as u64 * _h as u64 > MAX_WEB_PIXELS {
-        return Err(tr!(
-            "This panorama ({w}×{h}) is too large for the browser version.",
-            w = _w,
-            h = _h
-        ));
+/// What makes the cached pixels differ besides the source file.
+fn colour_signature(settings: &Settings) -> String {
+    if !settings.enable_color_management {
+        return "cm=off".into();
     }
-    Ok(())
-}
-
-/// Decode any supported image, returning the pixels and the embedded ICC profile.
-fn decode(data: &[u8]) -> Result<(image::DynamicImage, Option<Vec<u8>>), String> {
-    let err = |e: &dyn std::fmt::Display| tr!("Cannot decode this image: {error}", error = e);
-    if is_jxl(data) {
-        let mut decoder = jxl_oxide::integration::JxlDecoder::new(Cursor::new(data)).map_err(|e| err(&e))?;
-        let (w, h) = decoder.dimensions();
-        check_size(w, h)?;
-        let icc = decoder.icc_profile().ok().flatten();
-        let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
-        Ok((img, icc))
-    } else {
-        let mut reader = ImageReader::new(Cursor::new(data)).with_guessed_format().map_err(|e| e.to_string())?;
-        reader.no_limits();
-        let mut decoder = reader.into_decoder().map_err(|e| err(&e))?;
-        let (w, h) = decoder.dimensions();
-        check_size(w, h)?;
-        let icc = decoder.icc_profile().ok().flatten();
-        let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
-        Ok((img, icc))
+    match settings.monitor_profile {
+        MonitorProfile::Srgb => "cm=srgb".into(),
+        MonitorProfile::File => {
+            let p = &settings.monitor_profile_file;
+            let stamp = std::fs::metadata(p).ok().and_then(|m| m.modified().ok()).map(|t| format!("{t:?}"));
+            format!("cm=file:{p}:{stamp:?}")
+        }
     }
 }
+
+/// Identity of the image file, without reading it where possible.
+async fn source_identity(src: &Source) -> Result<String, String> {
+    match src {
+        Source::Path(p) => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let m = std::fs::metadata(p).map_err(|_| tr!("No such file: {path}", path = p.display()))?;
+                let path = p.canonicalize().unwrap_or_else(|_| p.clone());
+                Ok(format!("path:{}|{}|{:?}", path.display(), m.len(), m.modified().ok()))
+            }
+            #[cfg(target_arch = "wasm32")]
+            Err(tr!("No such file: {path}", path = p.display()))
+        }
+        Source::Memory { name, data, .. } => Ok(format!("mem:{name}|{}|{:x}", data.len(), store::hash_bytes(data))),
+        Source::Url(u) => {
+            #[cfg(target_arch = "wasm32")]
+            let fp = crate::web::fingerprint(u).await.unwrap_or_default();
+            #[cfg(not(target_arch = "wasm32"))]
+            let fp = String::new();
+            Ok(format!("url:{u}|{fp}"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline
 
 #[allow(clippy::too_many_arguments)]
 async fn load(
@@ -189,84 +204,44 @@ async fn load(
         *stage.lock().unwrap() = s.to_string();
         ctx.request_repaint();
     };
-    let cancelled = || cancel.load(Ordering::Relaxed);
 
-    let (mut params, image_source, data) = if source.is_fsv() {
+    let mut params = PanoParams::default();
+    let image_source = if source.is_fsv() {
         let text = decode_text(&source.read().await?);
-        let mut params = PanoParams::parse_fsv(&text)?;
+        params = PanoParams::parse_fsv(&text)?;
         let image = source.resolve(&params.image_name)?;
-        let data = image.read().await?;
         params.image = Some(image.clone());
-        (params, image, data)
+        image
     } else {
-        (PanoParams::default(), source.clone(), source.read().await?)
+        source.clone()
     };
-    let gpano = GPano::from_bytes(&data, &image_source.extension());
+
+    let identity = source_identity(&image_source).await?;
+    let key = format!(
+        "{:016x}",
+        store::hash_str(&format!("v{FORMAT_VERSION}|{identity}|{}", colour_signature(settings)))
+    );
+    let (tile_store, meta, from_cache) = match store::lookup(&key).await {
+        Some((s, m)) => {
+            set_stage(tr!("Loading from tile cache"));
+            (s, m, true)
+        }
+        None => {
+            let (s, m) = build_tiles(&image_source, &key, settings, progress, &set_stage, cancel, ctx).await?;
+            (s, m, false)
+        }
+    };
+    let (width, height) = (meta.width, meta.height);
+    let gpano = GPano { tags: meta.gpano.clone() };
     if !source.is_fsv() {
         params = PanoParams::from_image(image_source, &gpano);
     }
-    progress.store(50, Ordering::Relaxed);
-
-    set_stage(tr!("Decoding"));
-    yield_now().await;
-    let (img, icc) = decode(&data)?;
-    drop(data);
-    if cancelled() {
-        return Err("cancelled".into());
-    }
-    let (width, height) = (img.width(), img.height());
-    let mut rgb = img.into_rgb8();
-    progress.store(150, Ordering::Relaxed);
-
-    // ---- colour management -------------------------------------------------
-    let mut icc_used = None;
-    if settings.enable_color_management {
-        set_stage(tr!("Colour management"));
-        yield_now().await;
-        let output = match settings.monitor_profile {
-            MonitorProfile::File if !settings.monitor_profile_file.is_empty() => {
-                std::fs::read(&settings.monitor_profile_file)
-                    .ok()
-                    .and_then(|b| qcms::Profile::new_from_slice(&b, false))
-            }
-            _ => None,
-        };
-        let out_is_srgb = output.is_none();
-        let input = icc.as_deref().and_then(|b| qcms::Profile::new_from_slice(b, false));
-        if input.is_some() || !out_is_srgb {
-            let input = input.unwrap_or_else(qcms::Profile::new_sRGB);
-            let mut output = output.unwrap_or_else(qcms::Profile::new_sRGB);
-            output.precache_output_transform();
-            if let Some(xf) =
-                qcms::Transform::new(&input, &output, qcms::DataType::RGB8, qcms::Intent::Perceptual)
-            {
-                let row = width as usize * 3;
-                let rows_per = (height as usize).div_ceil(threads()).max(1);
-                par_chunks(&mut rgb, rows_per * row, |c, _| xf.apply(c));
-                icc_used = Some(if icc.is_some() { tr!("embedded ICC").into() } else { tr!("sRGB (assumed)").into() });
-            }
-        }
-    }
-    progress.store(250, Ordering::Relaxed);
-
-    // ---- resolution pyramid ----------------------------------------------------
-    set_stage(tr!("Building resolution levels"));
-    yield_now().await;
-    let grid = TileGrid::new(width, height);
-    let lut = Lut::new();
-    let levels = grid.levels.len();
-    let pyramid = Pyramid::build(rgb, &grid, &lut, |i| {
-        progress.store(250 + (450 * i / levels) as u32, Ordering::Relaxed);
-        ctx.request_repaint();
-    });
-    if cancelled() {
-        return Err("cancelled".into());
-    }
-    progress.store(700, Ordering::Relaxed);
+    progress.store(900, Ordering::Relaxed);
 
     // ---- GPU tile cache ------------------------------------------------------
     set_stage(tr!("Uploading to GPU"));
     yield_now().await;
+    let grid = TileGrid::new(width, height);
     let max_layers = device.limits().max_texture_array_layers;
     let mut budget = settings.max_gpu_memory_mb.max(64) as u64 * 1024 * 1024;
     let mut slots = grid.slots_for_budget(budget, max_layers);
@@ -287,15 +262,29 @@ async fn load(
         slots = fewer;
     };
     log::info!(
-        "{width}x{height}: {} levels, tiles {}x{}, {} of {} tiles cached on the GPU ({} MB)",
+        "{width}x{height}: {} levels, tiles {}x{}, {} of {} tiles cached on the GPU ({} MB), {}",
         grid.levels.len(),
         grid.cx,
         grid.cy,
         slots,
         grid.tile_count(),
-        (slots as u64 * grid.slot_bytes()) >> 20
+        (slots as u64 * grid.slot_bytes()) >> 20,
+        if from_cache { "tiles from cache" } else { "tiles built" }
     );
-    let tiles = TileCache::new(gpu, pyramid, lut, queue, ctx);
+
+    // The always-resident base level.
+    let lut = Lut::new();
+    let b = grid.base();
+    let mut base = Vec::new();
+    for ty in 0..grid.levels[b].ny {
+        for tx in 0..grid.levels[b].nx {
+            let t = TileId { level: b as u8, tx: tx as u16, ty: ty as u16 };
+            let jpeg = tile_store.get(t).await.map_err(|e| format!("{}: {e}", tr!("Tile cache is damaged")))?;
+            let rgb = store::decode_tile(&jpeg)?;
+            base.push((t, slot_mips(&rgb, &grid, &lut)));
+        }
+    }
+    let tiles = TileCache::new(gpu, tile_store, base, lut, queue, ctx);
     progress.store(1000, Ordering::Relaxed);
 
     Ok(LoadedPano {
@@ -305,9 +294,165 @@ async fn load(
         width,
         height,
         tiles,
-        icc_used,
+        icc_used: meta.icc_used,
         load_time: t0.elapsed().as_secs_f32(),
+        from_cache,
     })
+}
+
+/// Open the image file for reading, plus its GPano tags.
+async fn open_input(src: &Source) -> Result<(Box<dyn FnMut() -> Result<Input, String>>, GPano), String> {
+    let ext = src.extension();
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Source::Path(p) = src {
+        // Read straight from the file: huge images never have to fit in memory.
+        let p = p.clone();
+        let gpano = GPano::read(&p);
+        let open = move || -> Result<Input, String> {
+            let f = std::fs::File::open(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+            Ok(BufReader::with_capacity(1 << 20, Box::new(f) as Box<dyn ReadSeek>))
+        };
+        return Ok((Box::new(open), gpano));
+    }
+    let data = src.read().await?;
+    let gpano = GPano::from_bytes(&data, &ext);
+    let open = move || -> Result<Input, String> {
+        Ok(BufReader::with_capacity(1 << 20, Box::new(std::io::Cursor::new(data.clone())) as Box<dyn ReadSeek>))
+    };
+    Ok((Box::new(open), gpano))
+}
+
+/// Colour transform from the image's profile to the display profile.
+fn colour_transform(icc: Option<&[u8]>, settings: &Settings) -> (Option<qcms::Transform>, Option<String>) {
+    if !settings.enable_color_management {
+        return (None, None);
+    }
+    let output = match settings.monitor_profile {
+        MonitorProfile::File if !settings.monitor_profile_file.is_empty() => {
+            std::fs::read(&settings.monitor_profile_file).ok().and_then(|b| qcms::Profile::new_from_slice(&b, false))
+        }
+        _ => None,
+    };
+    let input = icc.and_then(|b| qcms::Profile::new_from_slice(b, false));
+    if input.is_none() && output.is_none() {
+        return (None, None); // sRGB to sRGB
+    }
+    let used = if input.is_some() { tr!("embedded ICC") } else { tr!("sRGB (assumed)") };
+    let input = input.unwrap_or_else(qcms::Profile::new_sRGB);
+    let mut output = output.unwrap_or_else(qcms::Profile::new_sRGB);
+    output.precache_output_transform();
+    let xf = qcms::Transform::new(&input, &output, qcms::DataType::RGB8, qcms::Intent::Perceptual);
+    let used = xf.as_ref().map(|_| used.to_string());
+    (xf, used)
+}
+
+/// Decode the image stripe by stripe and write all tiles to a new cache.
+#[allow(clippy::too_many_arguments)]
+async fn build_tiles(
+    src: &Source,
+    key: &str,
+    settings: &Settings,
+    progress: &AtomicU32,
+    set_stage: &impl Fn(&str),
+    cancel: &AtomicBool,
+    ctx: &eframe::egui::Context,
+) -> Result<(TileStore, CacheMeta), String> {
+    let (open, gpano) = open_input(src).await?;
+    set_stage(tr!("Building tiles"));
+    yield_now().await;
+    let mut decoded = open_rows(open)?;
+    let (w, h) = (decoded.width, decoded.height);
+    let (xf, icc_used) = colour_transform(decoded.icc.as_deref(), settings);
+    let grid = TileGrid::new(w, h);
+    let lut = Lut::new();
+    let mut builder = PyramidBuilder::new(grid.clone());
+    let building = store::begin(key).await;
+    log::info!(
+        "Building tiles for {w}x{h} ({}), {} tiles",
+        if decoded.streaming { "read in stripes" } else { "decoded at once" },
+        grid.tile_count()
+    );
+
+    // About 8 MB of rows per step.
+    let batch = ((8 << 20) / (w as usize * 3)).clamp(8, 512);
+    let mut rows = Vec::with_capacity(batch * w as usize * 3);
+    let mut done = 0usize;
+    let mut bytes = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        rows.clear();
+        let n = decoded.rows.read(batch, &mut rows)?;
+        if n == 0 {
+            break;
+        }
+        if let Some(xf) = &xf {
+            let per = n.div_ceil(threads()).max(1) * w as usize * 3;
+            par_chunks(&mut rows, per, |c, _| xf.apply(c));
+        }
+        builder.push_rows(&rows, &lut);
+        let tiles = builder.take_tiles();
+        if !tiles.is_empty() {
+            bytes += store_tiles(&building.store, tiles, &grid, cancel).await?;
+        }
+        done += n;
+        progress.store(50 + (850 * done as u64 / h as u64) as u32, Ordering::Relaxed);
+        ctx.request_repaint();
+        yield_now().await;
+    }
+    drop(decoded);
+    if !builder.is_complete() {
+        return Err(tr!("Cannot decode this image: {error}", error = "image data ended early"));
+    }
+    let meta = CacheMeta { version: FORMAT_VERSION, width: w, height: h, gpano: gpano.tags, icc_used, bytes };
+    let store = store::finish(building, &meta, settings.tile_cache_mb).await;
+    Ok((store, meta))
+}
+
+/// Encode tiles as JPEG and store them; returns the bytes written.
+async fn store_tiles(store: &TileStore, tiles: Vec<(TileId, Vec<u8>)>, grid: &TileGrid, cancel: &AtomicBool) -> Result<u64, String> {
+    let (w, h) = (grid.sx, grid.sy);
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let next = AtomicU32::new(0);
+        let bytes = std::sync::atomic::AtomicU64::new(0);
+        let error = Mutex::new(None);
+        std::thread::scope(|s| {
+            for _ in 0..threads().min(tiles.len()) {
+                s.spawn(|| {
+                    while !cancel.load(Ordering::Relaxed) {
+                        let i = next.fetch_add(1, Ordering::Relaxed) as usize;
+                        let Some((t, rgb)) = tiles.get(i) else { return };
+                        let r = store::encode_tile(rgb, w, h).and_then(|jpeg| {
+                            bytes.fetch_add(jpeg.len() as u64, Ordering::Relaxed);
+                            store.put_blocking(*t, jpeg)
+                        });
+                        if let Err(e) = r {
+                            *error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(e) = error.into_inner().unwrap() {
+            return Err(e);
+        }
+        Ok(bytes.into_inner())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = cancel;
+        let mut bytes = 0;
+        for (t, rgb) in tiles {
+            let jpeg = store::encode_tile(&rgb, w, h)?;
+            bytes += jpeg.len() as u64;
+            store.put(t, jpeg).await?;
+            yield_now().await;
+        }
+        Ok(bytes)
+    }
 }
 
 /// The browser cannot wait for a GPU readback; WebGPU reports allocation
@@ -373,9 +518,4 @@ mod tests {
         assert_eq!(data, (0..10).collect::<Vec<u8>>());
     }
 
-    #[test]
-    fn detects_jpeg_xl() {
-        assert!(is_jxl(&[0xFF, 0x0A, 1]));
-        assert!(!is_jxl(&[0xFF, 0xD8, 0xFF]));
-    }
 }

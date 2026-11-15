@@ -3,7 +3,11 @@
 
 //! Browser glue for the WebAssembly build.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
+
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::JsFuture;
 
 fn window() -> web_sys::Window {
@@ -93,4 +97,88 @@ pub fn show_startup_error(message: &str) {
     if let Some(el) = window().document().and_then(|d| d.get_element_by_id("loading-text")) {
         el.set_text_content(Some(message));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cache Storage (persistent tile cache)
+
+thread_local! {
+    static CACHES: RefCell<HashMap<String, web_sys::Cache>> = RefCell::new(HashMap::new());
+}
+
+async fn open_cache(name: &str) -> Result<web_sys::Cache, String> {
+    if let Some(c) = CACHES.with(|m| m.borrow().get(name).cloned()) {
+        return Ok(c);
+    }
+    let storage = window().caches().map_err(js_err)?;
+    let cache: web_sys::Cache = JsFuture::from(storage.open(name)).await.map_err(js_err)?.dyn_into().map_err(js_err)?;
+    CACHES.with(|m| m.borrow_mut().insert(name.to_string(), cache.clone()));
+    Ok(cache)
+}
+
+/// Cache entries are keyed by (relative) URLs.
+fn entry_url(key: &str) -> String {
+    format!("rustypano-cache/{key}")
+}
+
+pub async fn cache_put(name: &str, key: &str, data: &[u8]) -> Result<(), String> {
+    let cache = open_cache(name).await?;
+    let mut body = data.to_vec();
+    let resp = web_sys::Response::new_with_opt_u8_array(Some(&mut body)).map_err(js_err)?;
+    JsFuture::from(cache.put_with_str(&entry_url(key), &resp)).await.map_err(js_err)?;
+    Ok(())
+}
+
+pub async fn cache_get(name: &str, key: &str) -> Result<Option<Vec<u8>>, String> {
+    let cache = open_cache(name).await?;
+    let found = JsFuture::from(cache.match_with_str(&entry_url(key))).await.map_err(js_err)?;
+    if found.is_undefined() || found.is_null() {
+        return Ok(None);
+    }
+    let resp: web_sys::Response = found.dyn_into().map_err(js_err)?;
+    let buf = JsFuture::from(resp.array_buffer().map_err(js_err)?).await.map_err(js_err)?;
+    Ok(Some(js_sys::Uint8Array::new(&buf).to_vec()))
+}
+
+pub async fn cache_delete(name: &str) {
+    CACHES.with(|m| m.borrow_mut().remove(name));
+    if let Ok(storage) = window().caches() {
+        let _ = JsFuture::from(storage.delete(name)).await;
+    }
+}
+
+pub async fn cache_names() -> Vec<String> {
+    let Ok(storage) = window().caches() else { return Vec::new() };
+    let Ok(keys) = JsFuture::from(storage.keys()).await else { return Vec::new() };
+    js_sys::Array::from(&keys).iter().filter_map(|v| v.as_string()).collect()
+}
+
+/// Identity of a file on a web server without downloading it: ETag,
+/// Last-Modified and Content-Length from a HEAD request.
+pub async fn fingerprint(url: &str) -> Option<String> {
+    let init = web_sys::RequestInit::new();
+    init.set_method("HEAD");
+    let resp = JsFuture::from(window().fetch_with_str_and_init(url, &init)).await.ok()?;
+    let resp: web_sys::Response = resp.dyn_into().ok()?;
+    if !resp.ok() {
+        return None;
+    }
+    let h = resp.headers();
+    let get = |n: &str| h.get(n).ok().flatten().unwrap_or_default();
+    Some(format!("{}|{}|{}", get("etag"), get("last-modified"), get("content-length")))
+}
+
+/// Call `f` once a minute (also while the tab is in the background, where
+/// browsers throttle timers to about that rate anyway).
+pub fn every_minute(f: Box<dyn Fn()>) {
+    let c = Closure::wrap(f);
+    let _ = window().set_interval_with_callback_and_timeout_and_arguments_0(c.as_ref().unchecked_ref(), 60_000);
+    c.forget();
+}
+
+/// Call `f` when the page is closed or navigated away from.
+pub fn on_page_hide(f: Box<dyn Fn()>) {
+    let c = Closure::wrap(f);
+    let _ = window().add_event_listener_with_callback("pagehide", c.as_ref().unchecked_ref());
+    c.forget();
 }

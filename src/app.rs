@@ -123,6 +123,8 @@ pub struct RustyPanoApp {
     incoming: Arc<Mutex<Option<Source>>>,
     /// Tiles for the current view are still being loaded.
     tiles_streaming: bool,
+    /// "Clear" was pressed in the settings.
+    clear_cache_requested: bool,
 }
 
 /// Of several files opened together, the one to show: the first tour file,
@@ -174,6 +176,7 @@ impl RustyPanoApp {
             viewport_px: (1280.0, 720.0),
             incoming: Arc::new(Mutex::new(None)),
             tiles_streaming: false,
+            clear_cache_requested: false,
             settings,
         };
         if let Ok(i) = std::env::var("RUSTYPANO_INTERP") {
@@ -353,6 +356,26 @@ impl RustyPanoApp {
             let ov = Overrides { yaw: Some(p.view.yaw), pitch: Some(p.view.pitch), hfov: Some(p.view.hfov) };
             let src = p.loaded.source.clone();
             self.open(ctx, src, Some(ov));
+        }
+    }
+
+    /// Delete all cached tiles, then rebuild the current panorama's tiles.
+    fn clear_tile_cache(&mut self, ctx: &egui::Context) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            pollster::block_on(crate::store::clear_all());
+            self.reload(ctx);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let ctx2 = ctx.clone();
+            let reload = self.incoming.clone();
+            let current = self.pano.as_ref().map(|p| p.loaded.source.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                crate::store::clear_all().await;
+                *reload.lock().unwrap() = current;
+                ctx2.request_repaint();
+            });
         }
     }
 
@@ -1073,6 +1096,11 @@ impl RustyPanoApp {
                     ui.heading(format!("RustyPano {}", env!("CARGO_PKG_VERSION")));
                     ui.label(tr!("A GPU-accelerated viewer for equirectangular panoramas."));
                     ui.label(tr!("Built with wgpu, winit and egui."));
+                    ui.label(
+                        RichText::new(tr!("Tile encoding is based in part on the work of the Independent JPEG Group."))
+                            .small()
+                            .weak(),
+                    );
                     ui.add_space(6.0);
                     if let Some(p) = &self.pano {
                         let l = &p.loaded;
@@ -1084,6 +1112,13 @@ impl RustyPanoApp {
                             levels = g.grid.levels.len(),
                             secs = format!("{:.2}", l.load_time)
                         ));
+                        ui.label(if !l.tiles.is_persistent() {
+                            tr!("Tiles are kept in memory (no tile cache available).")
+                        } else if l.from_cache {
+                            tr!("Tiles loaded from the tile cache.")
+                        } else {
+                            tr!("Tiles built and saved to the tile cache.")
+                        });
                         ui.label(tr!(
                             "GPU tile cache: {used} of {slots} slots in use ({mb} MB), tiles of {tw}×{th} px",
                             used = l.tiles.used_slots(),
@@ -1226,6 +1261,23 @@ impl RustyPanoApp {
                         });
                     }
                     _ => {
+                        ui.horizontal(|ui| {
+                            ui.label(if cfg!(target_arch = "wasm32") {
+                                tr!("Tile cache in the browser")
+                            } else {
+                                tr!("Tile cache on disk")
+                            });
+                            ui.add(egui::DragValue::new(&mut draft.tile_cache_mb).range(256..=1_048_576).suffix(" MB").speed(64));
+                            if ui.button(tr!("Clear")).clicked() {
+                                self.clear_cache_requested = true;
+                            }
+                        });
+                        let mut note = tr!("Tiles of panoramas opened in this session are kept here; they are deleted when the app is closed.").to_string();
+                        if let Some(dir) = crate::store::location() {
+                            note = format!("{note}\n{dir}");
+                        }
+                        ui.label(RichText::new(note).weak());
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label(tr!("GPU tile cache"));
                             ui.add(egui::DragValue::new(&mut draft.max_gpu_memory_mb).range(64..=4096).suffix(" MB").speed(16));
@@ -1617,6 +1669,9 @@ impl eframe::App for RustyPanoApp {
             self.fullscreen = crate::web::is_fullscreen();
         }
         self.poll_job(&ctx);
+        if std::mem::take(&mut self.clear_cache_requested) {
+            self.clear_tile_cache(&ctx);
+        }
         if self.job.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
@@ -1638,5 +1693,12 @@ impl eframe::App for RustyPanoApp {
 
     fn on_exit(&mut self) {
         self.settings.save();
+        // The tile cache only lives as long as the app.
+        if let Some(job) = self.job.take() {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+        self.pano = None;
+        #[cfg(not(target_arch = "wasm32"))]
+        pollster::block_on(crate::store::end_session());
     }
 }

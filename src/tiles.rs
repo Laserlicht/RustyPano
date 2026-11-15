@@ -3,17 +3,18 @@
 
 //! Multi-resolution tile streaming.
 //!
-//! The decoded panorama is kept on the CPU as a pyramid (full resolution,
-//! half, quarter, …). Each pyramid level is cut into tiles of `cx × cy`
-//! pixels. On the GPU there is only a fixed-size cache: one
-//! `texture_2d_array` whose layers ("slots") hold one tile each, plus a page
-//! table texture that maps (level, tile x, tile y) to a slot.
+//! The panorama is a pyramid (full resolution, half, quarter, …) whose levels
+//! are cut into tiles of `cx × cy` pixels (see `pyramid.rs`). The tiles live
+//! in the tile store (`store.rs`: disk, browser cache or memory), not in RAM.
+//! On the GPU there is only a fixed-size cache: one `texture_2d_array` whose
+//! layers ("slots") hold one tile each, plus a page table texture that maps
+//! (level, tile x, tile y) to a slot.
 //!
 //! The coarsest level ("base") is always resident, so something can always be
 //! drawn. Every frame the visible tiles at the resolution the screen needs are
-//! determined on the CPU and missing ones are built and uploaded (natively by
-//! worker threads, in the browser within a time budget per frame); the least
-//! recently used tiles are evicted. The shader picks the finest resident level
+//! determined on the CPU and missing ones are loaded from the store and
+//! uploaded (natively by worker threads, in the browser asynchronously); the
+//! least recently used tiles are evicted. The shader picks the finest resident level
 //! for each pixel and falls back to coarser ones while tiles are streaming in.
 //!
 //! Each slot has a gutter of `GUTTER` real neighbouring pixels (wrapping
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use eframe::wgpu;
 
+use crate::store::TileStore;
 use crate::view::View;
 
 pub const GUTTER: u32 = 32;
@@ -174,7 +176,7 @@ impl TileGrid {
 }
 
 // ---------------------------------------------------------------------------
-// CPU pyramid
+// Tile pixels
 
 /// sRGB ↔ linear lookup tables for gamma-correct downsampling.
 pub struct Lut {
@@ -203,75 +205,39 @@ impl Lut {
         self.to_srgb[(l * 4095.0 + 0.5) as usize]
     }
     #[inline]
-    fn avg4(&self, a: u8, b: u8, c: u8, d: u8) -> u8 {
+    pub(crate) fn avg4(&self, a: u8, b: u8, c: u8, d: u8) -> u8 {
         let t = &self.to_lin;
         self.enc((t[a as usize] + t[b as usize] + t[c as usize] + t[d as usize]) * 0.25)
     }
 }
 
-/// The panorama at full, half, quarter, … resolution (one image per grid level).
-pub struct Pyramid {
-    pub levels: Vec<image::RgbImage>,
-}
-
-impl Pyramid {
-    pub fn build(full: image::RgbImage, grid: &TileGrid, lut: &Lut, mut progress: impl FnMut(usize)) -> Self {
-        let mut levels = vec![full];
-        for i in 1..grid.levels.len() {
-            let next = halve(&levels[i - 1], lut);
-            debug_assert_eq!((next.width(), next.height()), (grid.levels[i].w, grid.levels[i].h));
-            levels.push(next);
-            progress(i);
-        }
-        Self { levels }
-    }
-}
-
-/// Gamma-correct 2× box downscale of an RGB image (odd sizes round up).
-pub fn halve(src: &image::RgbImage, lut: &Lut) -> image::RgbImage {
+/// Gamma-correct 2× box downscale of a whole RGB image (odd sizes round up).
+/// The streaming builder does the same row by row; this is the reference.
+#[cfg(test)]
+pub(crate) fn halve(src: &image::RgbImage, lut: &Lut) -> image::RgbImage {
     let (w, h) = (src.width() as usize, src.height() as usize);
     let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
     let mut out = image::RgbImage::new(nw as u32, nh as u32);
     let s = src.as_raw();
-    let rows_per = nh.div_ceil(crate::loader::threads()).max(1);
-    crate::loader::par_chunks(&mut out, rows_per * nw * 3, |chunk, first_byte| {
-        let y0 = first_byte / (nw * 3);
-        for (r, row) in chunk.chunks_mut(nw * 3).enumerate() {
-            let y = y0 + r;
-            let (a, b) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
-            for x in 0..nw {
-                let (p, q) = ((2 * x).min(w - 1), (2 * x + 1).min(w - 1));
-                for c in 0..3 {
-                    row[x * 3 + c] = lut.avg4(
-                        s[(a * w + p) * 3 + c],
-                        s[(a * w + q) * 3 + c],
-                        s[(b * w + p) * 3 + c],
-                        s[(b * w + q) * 3 + c],
-                    );
-                }
+    for y in 0..nh {
+        let (a, b) = ((2 * y).min(h - 1), (2 * y + 1).min(h - 1));
+        for x in 0..nw {
+            let (p, q) = ((2 * x).min(w - 1), (2 * x + 1).min(w - 1));
+            for c in 0..3 {
+                let v = lut.avg4(s[(a * w + p) * 3 + c], s[(a * w + q) * 3 + c], s[(b * w + p) * 3 + c], s[(b * w + q) * 3 + c]);
+                out.get_pixel_mut(x as u32, y as u32).0[c] = v;
             }
         }
-    });
+    }
     out
 }
 
-/// RGBA pixels of one tile with gutter, followed by its mip chain.
-pub fn build_tile(pyr: &Pyramid, grid: &TileGrid, t: TileId, lut: &Lut) -> Vec<Vec<u8>> {
-    let img = &pyr.levels[t.level as usize];
-    let (w, h) = (img.width() as i64, img.height() as i64);
+/// RGBA mip chain for a cache slot from a tile's RGB8 pixels (incl. gutter).
+pub fn slot_mips(rgb: &[u8], grid: &TileGrid, lut: &Lut) -> Vec<Vec<u8>> {
     let (sx, sy) = (grid.sx as usize, grid.sy as usize);
-    let x0 = (t.tx as u32 * grid.cx) as i64 - GUTTER as i64;
-    let y0 = (t.ty as u32 * grid.cy) as i64 - GUTTER as i64;
-    let src = img.as_raw();
-    let cols: Vec<usize> = (0..sx as i64).map(|i| (x0 + i).rem_euclid(w) as usize).collect();
     let mut level = vec![255u8; sx * sy * 4];
-    for j in 0..sy {
-        let syy = (y0 + j as i64).clamp(0, h - 1) as usize;
-        let srow = &src[syy * w as usize * 3..(syy + 1) * w as usize * 3];
-        let drow = &mut level[j * sx * 4..(j + 1) * sx * 4];
-        for (i, &c) in cols.iter().enumerate() {
-            drow[i * 4..i * 4 + 3].copy_from_slice(&srow[c * 3..c * 3 + 3]);
-        }
+    for (d, s) in level.as_chunks_mut::<4>().0.iter_mut().zip(rgb.as_chunks::<3>().0) {
+        d[..3].copy_from_slice(s);
     }
     let n = grid.mip_levels() as usize;
     let mut mips = Vec::with_capacity(n);
@@ -284,6 +250,20 @@ pub fn build_tile(pyr: &Pyramid, grid: &TileGrid, t: TileId, lut: &Lut) -> Vec<V
         mips.push(next);
     }
     mips
+}
+
+/// Mip chain of a tile ready for upload, or `None` if it could not be loaded.
+type TileMips = Option<Vec<Vec<u8>>>;
+
+/// Load a tile from the store and prepare it for upload.
+#[cfg(not(target_arch = "wasm32"))]
+fn load_tile(store: &TileStore, grid: &TileGrid, t: TileId, lut: &Lut) -> TileMips {
+    tile_from_bytes(store.get_blocking(t), grid, lut)
+}
+
+fn tile_from_bytes(data: Result<Vec<u8>, String>, grid: &TileGrid, lut: &Lut) -> TileMips {
+    let rgb = crate::store::decode_tile(&data.ok()?).ok()?;
+    (rgb.len() == grid.sx as usize * grid.sy as usize * 3).then(|| slot_mips(&rgb, grid, lut))
 }
 
 fn downsample_rgba(src: &[u8], w: usize, h: usize, lut: &Lut) -> Vec<u8> {
@@ -387,16 +367,19 @@ impl GpuTiles {
     }
 }
 
-/// Streams tiles into the GPU cache. Lives with the displayed panorama.
+/// Streams tiles from the tile store into the GPU cache. Lives with the
+/// displayed panorama.
 pub struct TileCache {
     pub gpu: Arc<GpuTiles>,
-    pyramid: Arc<Pyramid>,
+    store: Arc<TileStore>,
     lut: Arc<Lut>,
     owner: Vec<Option<TileId>>,
     last_used: Vec<u64>,
     pinned: u32,
     resident: HashMap<TileId, u32>,
     pending: HashSet<TileId>,
+    /// Tiles that could not be loaded; not requested again.
+    failed: HashSet<TileId>,
     table: Vec<u32>,
     table_dirty: bool,
     frame: u64,
@@ -405,18 +388,26 @@ pub struct TileCache {
     #[cfg(not(target_arch = "wasm32"))]
     requests: Option<mpsc::Sender<TileId>>,
     #[cfg(not(target_arch = "wasm32"))]
-    results: mpsc::Receiver<(TileId, Option<Vec<Vec<u8>>>)>,
+    results: mpsc::Receiver<(TileId, TileMips)>,
     #[cfg(not(target_arch = "wasm32"))]
     wanted: Arc<Mutex<HashSet<TileId>>>,
     #[cfg(target_arch = "wasm32")]
     queue: VecDeque<TileId>,
+    #[cfg(target_arch = "wasm32")]
+    ready: Arc<std::sync::Mutex<Vec<(TileId, TileMips)>>>,
+    #[cfg(target_arch = "wasm32")]
+    in_flight: usize,
+    #[cfg(target_arch = "wasm32")]
+    ctx: eframe::egui::Context,
 }
 
 impl TileCache {
-    /// Upload the base level (always resident) and start the tile workers.
+    /// Upload the base level (always resident, already loaded by the caller)
+    /// and start the tile workers.
     pub fn new(
         gpu: GpuTiles,
-        pyramid: Pyramid,
+        store: TileStore,
+        base: Vec<(TileId, Vec<Vec<u8>>)>,
         lut: Lut,
         queue: &wgpu::Queue,
         ctx: &eframe::egui::Context,
@@ -425,13 +416,14 @@ impl TileCache {
         let slots = gpu.slots as usize;
         let mut cache = Self {
             gpu: Arc::new(gpu),
-            pyramid: Arc::new(pyramid),
+            store: Arc::new(store),
             lut: Arc::new(lut),
             owner: vec![None; slots],
             last_used: vec![0; slots],
             pinned: 0,
             resident: HashMap::new(),
             pending: HashSet::new(),
+            failed: HashSet::new(),
             table: vec![0; (grid.table_w * grid.table_h) as usize],
             table_dirty: true,
             frame: 0,
@@ -445,24 +437,27 @@ impl TileCache {
             wanted: Arc::new(Mutex::new(HashSet::new())),
             #[cfg(target_arch = "wasm32")]
             queue: VecDeque::new(),
+            #[cfg(target_arch = "wasm32")]
+            ready: Arc::new(std::sync::Mutex::new(Vec::new())),
+            #[cfg(target_arch = "wasm32")]
+            in_flight: 0,
+            #[cfg(target_arch = "wasm32")]
+            ctx: ctx.clone(),
         };
-        let base = grid.base();
-        let b = grid.levels[base];
-        for ty in 0..b.ny {
-            for tx in 0..b.nx {
-                let t = TileId { level: base as u8, tx: tx as u16, ty: ty as u16 };
-                let mips = build_tile(&cache.pyramid, &grid, t, &cache.lut);
-                cache.install(t, &mips, queue);
-            }
+        for (t, mips) in base {
+            cache.install(t, &mips, queue);
         }
         cache.pinned = cache.resident.len() as u32;
         cache.gpu.write_table(queue, &cache.table);
         cache.table_dirty = false;
         #[cfg(not(target_arch = "wasm32"))]
         cache.start_workers(ctx);
-        #[cfg(target_arch = "wasm32")]
-        let _ = ctx;
         cache
+    }
+
+    /// Whether the tiles survive closing the app (disk or browser cache).
+    pub fn is_persistent(&self) -> bool {
+        self.store.is_persistent()
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -473,7 +468,7 @@ impl TileCache {
         let workers = (crate::loader::threads() / 2).clamp(1, 4);
         for i in 0..workers {
             let (rx, tx) = (req_rx.clone(), res_tx.clone());
-            let (pyr, lut, wanted, ctx) = (self.pyramid.clone(), self.lut.clone(), self.wanted.clone(), ctx.clone());
+            let (store, lut, wanted, ctx) = (self.store.clone(), self.lut.clone(), self.wanted.clone(), ctx.clone());
             let grid = self.gpu.grid.clone();
             std::thread::Builder::new()
                 .name(format!("tile-worker-{i}"))
@@ -481,7 +476,7 @@ impl TileCache {
                     loop {
                         let Ok(t) = rx.lock().unwrap().recv() else { return };
                         // Skip tiles that scrolled out of view while queued.
-                        let data = wanted.lock().unwrap().contains(&t).then(|| build_tile(&pyr, &grid, t, &lut));
+                        let data = if wanted.lock().unwrap().contains(&t) { load_tile(&store, &grid, t, &lut) } else { None };
                         if tx.send((t, data)).is_err() {
                             return;
                         }
@@ -544,7 +539,8 @@ impl TileCache {
         for t in &self.needed {
             match self.resident.get(t) {
                 Some(&s) => self.last_used[s as usize] = self.frame,
-                None => missing.push(*t),
+                None if !self.failed.contains(t) => missing.push(*t),
+                None => {}
             }
         }
 
@@ -558,10 +554,16 @@ impl TileCache {
                     }
                 }
             }
+            let wanted = self.wanted.lock().unwrap().clone();
             while let Ok((t, data)) = self.results.try_recv() {
                 self.pending.remove(&t);
-                if let Some(mips) = data {
-                    self.install(t, &mips, queue);
+                match data {
+                    Some(mips) => self.install(t, &mips, queue),
+                    // Skipped because it scrolled away, or failed to load.
+                    None if wanted.contains(&t) => {
+                        self.failed.insert(t);
+                    }
+                    None => {}
                 }
             }
         }
@@ -570,20 +572,34 @@ impl TileCache {
         {
             let wanted: HashSet<TileId> = missing.iter().copied().collect();
             self.queue.retain(|t| wanted.contains(t));
-            self.pending.retain(|t| wanted.contains(t));
             for t in &missing {
-                if self.pending.insert(*t) {
+                if !self.pending.contains(t) && !self.queue.contains(t) {
                     self.queue.push_back(*t);
                 }
             }
-            // Build tiles on the main thread for at most ~8 ms per frame.
-            let t0 = web_time::Instant::now();
-            while let Some(t) = self.queue.pop_front() {
+            // Reading from the browser cache is asynchronous; decoding runs
+            // on the main thread, so only a couple of tiles are in flight.
+            while self.in_flight < 2 {
+                let Some(t) = self.queue.pop_front() else { break };
+                self.pending.insert(t);
+                self.in_flight += 1;
+                let (store, grid, lut, ready, ctx) =
+                    (self.store.clone(), self.gpu.grid.clone(), self.lut.clone(), self.ready.clone(), self.ctx.clone());
+                wasm_bindgen_futures::spawn_local(async move {
+                    let mips = tile_from_bytes(store.get(t).await, &grid, &lut);
+                    ready.lock().unwrap().push((t, mips));
+                    ctx.request_repaint();
+                });
+            }
+            let done = std::mem::take(&mut *self.ready.lock().unwrap());
+            for (t, mips) in done {
+                self.in_flight -= 1;
                 self.pending.remove(&t);
-                let mips = build_tile(&self.pyramid, &self.gpu.grid, t, &self.lut);
-                self.install(t, &mips, queue);
-                if t0.elapsed().as_millis() >= 8 {
-                    break;
+                match mips {
+                    Some(m) => self.install(t, &m, queue),
+                    None => {
+                        self.failed.insert(t);
+                    }
                 }
             }
         }
@@ -592,6 +608,9 @@ impl TileCache {
             self.gpu.write_table(queue, &self.table);
             self.table_dirty = false;
         }
+        #[cfg(target_arch = "wasm32")]
+        return !self.pending.is_empty() || !self.queue.is_empty();
+        #[cfg(not(target_arch = "wasm32"))]
         !self.pending.is_empty()
     }
 }
@@ -678,19 +697,6 @@ mod tests {
             assert!(n >= g.base_tiles());
             assert!(n <= MAX_SLOTS + 1);
         }
-    }
-
-    #[test]
-    fn tile_gutter_wraps_horizontally() {
-        let mut img = image::RgbImage::new(64, 32);
-        img.put_pixel(63, 0, image::Rgb([9, 8, 7]));
-        let g = TileGrid::new(64, 32);
-        let lut = Lut::new();
-        let pyr = Pyramid { levels: vec![img] };
-        let mips = build_tile(&pyr, &g, TileId { level: 0, tx: 0, ty: 0 }, &lut);
-        let i = ((GUTTER as usize) * g.sx as usize + (GUTTER as usize - 1)) * 4;
-        assert_eq!(&mips[0][i..i + 3], &[9, 8, 7]);
-        assert_eq!(mips.len() as u32, g.mip_levels());
     }
 
     #[test]

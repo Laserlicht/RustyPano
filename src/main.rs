@@ -10,9 +10,11 @@ mod i18n;
 mod app;
 mod fsv;
 mod loader;
+mod pyramid;
 mod render;
 mod settings;
 mod source;
+mod store;
 mod tiles;
 mod view;
 #[cfg(target_arch = "wasm32")]
@@ -143,6 +145,7 @@ fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,rustypano=info")).init();
     let settings = settings::Settings::load();
     i18n::apply(settings.language);
+    store::start_session();
     let parsed = match parse_args() {
         Ok(p) => p,
         Err(e) => {
@@ -191,6 +194,7 @@ fn main() {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
     let settings = settings::Settings::load();
     i18n::apply(settings.language);
+    store::start_session();
 
     let mut cli = app::CliOptions { file: None, yaw: None, pitch: None, hfov: None, fullscreen: false, hotspots_on: false };
     for (k, v) in web::url_params() {
