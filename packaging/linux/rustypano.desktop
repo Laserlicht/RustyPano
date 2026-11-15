@@ -9,5 +9,5 @@ Exec=rustypano %f
 Icon=rustypano
 Terminal=false
 Categories=Graphics;Viewer;
-MimeType=image/jpeg;image/tiff;image/png;image/webp;image/bmp;image/jxl;
+MimeType=image/jpeg;image/tiff;image/png;image/webp;image/bmp;image/jxl;image/vnd.adobe.photoshop;
 Keywords=panorama;360;equirectangular;photosphere;

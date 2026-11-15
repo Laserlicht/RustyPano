@@ -104,7 +104,7 @@ pub fn start_load(
 
 /// Image file extensions the viewer opens (lower case).
 pub const IMAGE_EXTENSIONS: &[&str] =
-    &["jpg", "jpeg", "jpe", "tif", "tiff", "png", "webp", "bmp", "jxl"];
+    &["jpg", "jpeg", "jpe", "tif", "tiff", "png", "webp", "bmp", "jxl", "psd", "psb"];
 
 pub fn is_supported_ext(ext: &str) -> bool {
     ext == "fsv" || IMAGE_EXTENSIONS.contains(&ext)

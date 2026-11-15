@@ -652,6 +652,13 @@ pub fn open_rows(mut reopen: impl FnMut() -> Result<Input, String>) -> Result<De
         return full_decode(reopen()?, MAX_FULL_PIXELS);
     }
 
+    if crate::psd::is_psd(&head) {
+        drop(input);
+        let (info, rows) = crate::psd::open(reopen)?;
+        check_pixels(info.width, info.height, MAX_STREAM_PIXELS)?;
+        return Ok(Decoded { width: info.width, height: info.height, icc: info.icc, rows, streaming: true });
+    }
+
     if head.starts_with(b"BM") {
         let mut dec = image::codecs::bmp::BmpDecoder::new(input).map_err(err)?;
         let (w, h) = dec.dimensions();

@@ -11,6 +11,7 @@ mod inertia;
 mod app;
 mod fsv;
 mod loader;
+mod psd;
 mod pyramid;
 mod render;
 mod settings;

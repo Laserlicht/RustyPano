@@ -117,6 +117,7 @@ fn read_xmp(data: &[u8], ext: &str) -> Option<String> {
         // WebP (RIFF "XMP " chunk) and JPEG XL ("xml " box) store the packet
         // uncompressed in most files: scan for it.
         "webp" | "jxl" => scan_xmp(data),
+        "psd" | "psb" => crate::psd::xmp(data),
         _ => None,
     }
 }

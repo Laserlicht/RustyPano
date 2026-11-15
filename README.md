@@ -70,7 +70,7 @@ not delete in time is removed the next time the page is opened). Not available i
 browser: previous/next image in folder, recent files, saving Photo Sphere tags
 into files and display ICC profiles from files. Size limits in the browser:
 300 megapixels for WebP (decoded as a whole), 2 gigapixels for baseline JPEG,
-PNG, TIFF, JPEG XL and BMP (read in stripes), and progressive JPEG up to about
+PNG, TIFF, JPEG XL, BMP and PSD/PSB (read in stripes), and progressive JPEG up to about
 2.9 GB of DCT coefficients (6 bytes per pixel without chroma subsampling, so
 about 500 megapixels; with 4:2:0 twice that).
 
@@ -94,10 +94,14 @@ or key press stops it.
 
 ## Features
 
-- Equirectangular panoramas in JPEG, TIFF (8/16-bit), PNG, WebP, BMP and
-  JPEG XL, full or partial (vertical extent from `HORIZONPOSITION` or GPano
-  cropped-area tags). Embedded ICC profiles are honoured; GPano XMP is read
-  from all formats except BMP and written into JPEG only.
+- Equirectangular panoramas in JPEG, TIFF (8/16-bit), PNG, WebP, BMP,
+  JPEG XL and Photoshop PSD/PSB, full or partial (vertical extent from
+  `HORIZONPOSITION` or GPano cropped-area tags). Embedded ICC profiles are
+  honoured; GPano XMP is read from all formats except BMP and written into
+  JPEG only.
+- Photoshop documents: the merged image is shown (layers are not composited,
+  so it must have been saved with "Maximize compatibility"), RGB or grayscale,
+  8 or 16 bits, uncompressed or RLE; PSB for documents over 30000 pixels.
 - `.fsv` files: `IMAGENAME`, `WINDOWTITLE`, `YAW`, `PITCH`, `HFOV`,
   `HORIZONPOSITION`, `MIN/MAXYAW`, `MIN/MAXPITCH`, `AUTOSPIN`, and
   `BEGIN HOTSPOT … END HOTSPOT` blocks (`X`, `Y` in percent, `DESCRIPTION`,
@@ -126,8 +130,10 @@ or key press stops it.
 Panoramas are shown in multiple resolutions from a tile cache, so neither the
 GPU nor main memory has to hold the whole image:
 
-- **Reading** (`src/pyramid.rs`): JPEG, PNG, TIFF (strips or tiles),
-  JPEG XL and BMP are decoded stripe by stripe. Progressive JPEG refines every
+- **Reading** (`src/pyramid.rs`, `src/psd.rs`): JPEG, PNG, TIFF (strips or
+  tiles), JPEG XL, BMP and PSD/PSB are decoded stripe by stripe (PSD stores
+  the merged image channel after channel, so each channel gets a reader of
+  its own). Progressive JPEG refines every
   pixel until the last scan, so its DCT coefficients (2 bytes per sample) are
   kept until the end, but the pixels are still produced stripe by stripe
   rather than as a whole RGB image. WebP is limited to 16383 px per side
