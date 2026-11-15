@@ -4,10 +4,11 @@
 //! Building the tile pyramid from an image read in horizontal stripes.
 //!
 //! [`open_rows`] turns an image file into a [`RowReader`] that hands out RGB8
-//! rows from top to bottom. PNG, TIFF (strips and tiles), JPEG XL and BMP are
-//! read stripe by stripe, so only a few rows are in memory at a time; JPEG and
-//! WebP decoders can only produce the whole image, which is then handed out
-//! row by row and freed afterwards.
+//! rows from top to bottom. Baseline JPEG, PNG, TIFF (strips and tiles),
+//! JPEG XL and BMP are read stripe by stripe, so only a few rows are in memory
+//! at a time. Progressive JPEG (which needs all DCT coefficients before the
+//! first row) and WebP (at most 16383 px per side anyway) are decoded as a
+//! whole, handed out row by row and freed afterwards.
 //!
 //! [`PyramidBuilder`] consumes those rows. For every pyramid level it keeps a
 //! band of about one tile row, emits finished tiles (with their gutter) as soon
@@ -239,6 +240,257 @@ impl<D: ImageDecoderRect> RowReader for RectRows<D> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Baseline JPEG, one iMCU row (8 or 16 rows) at a time
+
+/// zune-jpeg's fixed-point YCbCr → RGB coefficients (14-bit precision), so
+/// the result matches its full decode.
+const Y_CF: i32 = 16384;
+const CR_CF: i32 = 22970;
+const CB_CF: i32 = 29032;
+const G_CR: i32 = -11700;
+const G_CB: i32 = -5638;
+const YUV_RND: i32 = (1 << 13) - 1;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JpegColour {
+    Gray,
+    YCbCr,
+    Rgb,
+}
+
+/// zune-jpeg peeks by reading and seeking back. `BufReader::seek` throws its
+/// buffer away every time, which made decoding ten times slower; this keeps
+/// relative seeks inside the buffer and tracks the position itself.
+struct PeekFriendly {
+    inner: Input,
+    pos: u64,
+}
+
+impl Read for PeekFriendly {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl BufRead for PeekFriendly {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+    fn consume(&mut self, amt: usize) {
+        self.inner.consume(amt);
+        self.pos += amt as u64;
+    }
+}
+
+impl Seek for PeekFriendly {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        match to {
+            std::io::SeekFrom::Current(d) => {
+                self.inner.seek_relative(d)?;
+                self.pos = self.pos.checked_add_signed(d).ok_or(std::io::ErrorKind::InvalidInput)?;
+            }
+            other => self.pos = self.inner.seek(other)?,
+        }
+        Ok(self.pos)
+    }
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.pos)
+    }
+}
+
+struct JpegRows {
+    dec: zune_jpeg::JpegDecoder<PeekFriendly>,
+    width: usize,
+    height: usize,
+    colour: JpegColour,
+    planes: Vec<zune_jpeg::PlaneInfo>,
+    /// Up-sampling factor of each component (1 or 2) horizontally / vertically.
+    fx: Vec<usize>,
+    fy: Vec<usize>,
+    /// Decoded component rows still needed, from row `first[c]` on.
+    rows: Vec<VecDeque<Vec<u8>>>,
+    first: Vec<usize>,
+    received: Vec<usize>,
+    /// Buffers for one iMCU row per component.
+    imcu: Vec<Vec<u8>>,
+    next_out: usize,
+    complete: bool,
+}
+
+impl JpegRows {
+    fn pull(&mut self) -> Result<(), String> {
+        let strides: Vec<usize> = self.planes.iter().map(|p| p.stride).collect();
+        let mut planes: Vec<&mut [u8]> = self.imcu.iter_mut().map(Vec::as_mut_slice).collect();
+        match self.dec.raw_output().decode_next_imcu_row(&mut planes, &strides).map_err(err)? {
+            zune_jpeg::RawImcuRowStatus::RowReady { rows_written } => {
+                for (c, p) in self.planes.iter().enumerate() {
+                    for r in 0..rows_written[c] {
+                        let start = r * p.stride;
+                        self.rows[c].push_back(self.imcu[c][start..start + p.width].to_vec());
+                    }
+                    self.received[c] += rows_written[c];
+                }
+            }
+            zune_jpeg::RawImcuRowStatus::Complete => self.complete = true,
+            zune_jpeg::RawImcuRowStatus::NeedMoreInput => return Err(err("truncated JPEG")),
+            _ => return Err(err("unexpected JPEG decoder state")),
+        }
+        Ok(())
+    }
+
+    /// Component rows needed for output row `y`: the nearest sample row and,
+    /// for vertically up-sampled components, its neighbour on that side.
+    fn needed(&self, c: usize, y: usize) -> (usize, usize) {
+        let h = self.planes[c].height;
+        if self.fy[c] == 1 {
+            return (y.min(h - 1), y.min(h - 1));
+        }
+        let near = (y / 2).min(h - 1);
+        let far = if y.is_multiple_of(2) { near.saturating_sub(1) } else { (near + 1).min(h - 1) };
+        (near, far)
+    }
+
+    /// One component, up-sampled to the full image width (same "fancy"
+    /// triangle filter as zune-jpeg: vertical first, then horizontal).
+    fn component_row(&self, c: usize, y: usize) -> Vec<u8> {
+        let (near, far) = self.needed(c, y);
+        let row = |i: usize| &self.rows[c][i - self.first[c]];
+        let src: Vec<u8> = if self.fy[c] == 1 {
+            row(near).to_vec()
+        } else {
+            let (a, b) = (row(near), row(far));
+            a.iter().zip(b).map(|(&n, &f)| ((3 * n as u16 + f as u16 + 2) >> 2) as u8).collect()
+        };
+        if self.fx[c] == 1 {
+            return src;
+        }
+        let n = src.len();
+        let mut out = vec![0u8; self.width];
+        for (x, o) in out.iter_mut().enumerate() {
+            let i = (x / 2).min(n - 1);
+            let j = if x % 2 == 0 { i.saturating_sub(1) } else { (i + 1).min(n - 1) };
+            *o = ((3 * src[i] as u16 + src[j] as u16 + 2) >> 2) as u8;
+        }
+        out
+    }
+
+    fn emit(&mut self, out: &mut Vec<u8>) {
+        let y = self.next_out;
+        let comps: Vec<Vec<u8>> = (0..self.planes.len()).map(|c| self.component_row(c, y)).collect();
+        match self.colour {
+            JpegColour::Gray => comps[0][..self.width].iter().for_each(|&g| out.extend_from_slice(&[g, g, g])),
+            JpegColour::Rgb => {
+                for x in 0..self.width {
+                    out.extend_from_slice(&[comps[0][x], comps[1][x], comps[2][x]]);
+                }
+            }
+            JpegColour::YCbCr => {
+                let clamp = |v: i32| v.clamp(0, 255) as u8;
+                for x in 0..self.width {
+                    let y0 = comps[0][x] as i32 * Y_CF + YUV_RND;
+                    let (cb, cr) = (comps[1][x] as i32 - 128, comps[2][x] as i32 - 128);
+                    out.extend_from_slice(&[
+                        clamp((y0 + cr * CR_CF) >> 14),
+                        clamp((y0 + cr * G_CR + cb * G_CB) >> 14),
+                        clamp((y0 + cb * CB_CF) >> 14),
+                    ]);
+                }
+            }
+        }
+        self.next_out += 1;
+        // Forget rows no later output row needs.
+        if self.next_out < self.height {
+            for c in 0..self.planes.len() {
+                let (a, b) = self.needed(c, self.next_out);
+                let keep = a.min(b);
+                while self.first[c] < keep {
+                    self.rows[c].pop_front();
+                    self.first[c] += 1;
+                }
+            }
+        }
+    }
+}
+
+impl RowReader for JpegRows {
+    fn read(&mut self, max: usize, out: &mut Vec<u8>) -> Result<usize, String> {
+        let mut n = 0;
+        while n < max && self.next_out < self.height {
+            let y = self.next_out;
+            let ready = (0..self.planes.len()).all(|c| {
+                let (a, b) = self.needed(c, y);
+                self.received[c] > a.max(b)
+            });
+            if ready {
+                self.emit(out);
+                n += 1;
+            } else if self.complete {
+                return Err(err("JPEG data ended early"));
+            } else {
+                self.pull()?;
+            }
+        }
+        Ok(n)
+    }
+}
+
+/// Streaming reader for baseline/sequential JPEGs in grey, YCbCr or RGB with
+/// 1×/2× chroma subsampling; `None` for anything else (progressive, CMYK, …),
+/// which is decoded as a whole instead.
+fn open_jpeg(mut input: Input) -> Result<Option<Decoded>, String> {
+    use zune_jpeg::zune_core::colorspace::ColorSpace;
+    use zune_jpeg::zune_core::options::DecoderOptions;
+    let opts = DecoderOptions::default().set_max_width(usize::from(u16::MAX)).set_max_height(usize::from(u16::MAX));
+    let pos = input.stream_position().map_err(|e| e.to_string())?;
+    let mut dec = zune_jpeg::JpegDecoder::new_with_options(PeekFriendly { inner: input, pos }, opts);
+    if dec.decode_headers().is_err() {
+        return Ok(None);
+    }
+    let Some(info) = dec.info() else { return Ok(None) };
+    let sequential = info.sof.is_sequential_dct();
+    let colour = match (dec.input_colorspace(), info.components) {
+        (Some(ColorSpace::Luma), 1) => JpegColour::Gray,
+        (Some(ColorSpace::YCbCr), 3) => JpegColour::YCbCr,
+        (Some(ColorSpace::RGB), 3) => JpegColour::Rgb,
+        _ => return Ok(None),
+    };
+    let (w, h) = (info.width as usize, info.height as usize);
+    if !sequential || w == 0 || h == 0 {
+        return Ok(None);
+    }
+    let Some(layout) = dec.raw_output().layout() else { return Ok(None) };
+    let planes: Vec<zune_jpeg::PlaneInfo> = layout[..info.components as usize].to_vec();
+    let hmax = planes.iter().map(|p| p.horizontal_sampling_factor).max().unwrap_or(1);
+    let vmax = planes.iter().map(|p| p.vertical_sampling_factor).max().unwrap_or(1);
+    let factor = |max: usize, f: usize| (f > 0 && max.is_multiple_of(f)).then(|| max / f).filter(|r| *r <= 2);
+    let fx: Option<Vec<usize>> = planes.iter().map(|p| factor(hmax, p.horizontal_sampling_factor)).collect();
+    let fy: Option<Vec<usize>> = planes.iter().map(|p| factor(vmax, p.vertical_sampling_factor)).collect();
+    let (Some(fx), Some(fy)) = (fx, fy) else { return Ok(None) };
+    check_pixels(w as u32, h as u32, MAX_STREAM_PIXELS)?;
+    let icc = dec.icc_profile();
+    let n = planes.len();
+    let imcu = planes.iter().map(|p| vec![0u8; p.stride * p.vertical_sampling_factor * 8]).collect();
+    let rows = JpegRows {
+        dec,
+        width: w,
+        height: h,
+        colour,
+        planes,
+        fx,
+        fy,
+        rows: vec![VecDeque::new(); n],
+        first: vec![0; n],
+        received: vec![0; n],
+        imcu,
+        next_out: 0,
+        complete: false,
+    };
+    Ok(Some(Decoded { width: w as u32, height: h as u32, icc, rows: Box::new(rows), streaming: true }))
+}
+
 fn is_jxl(head: &[u8]) -> bool {
     head.starts_with(&[0xFF, 0x0A]) || head.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n")
 }
@@ -318,6 +570,13 @@ pub fn open_rows(mut reopen: impl FnMut() -> Result<Input, String>) -> Result<De
         return full_decode(reopen()?, MAX_FULL_PIXELS);
     }
 
+    if head.starts_with(&[0xFF, 0xD8]) {
+        if let Some(d) = open_jpeg(input)? {
+            return Ok(d);
+        }
+        return full_decode(reopen()?, MAX_FULL_PIXELS);
+    }
+
     if head.starts_with(b"BM") {
         let mut dec = image::codecs::bmp::BmpDecoder::new(input).map_err(err)?;
         let (w, h) = dec.dimensions();
@@ -327,7 +586,7 @@ pub fn open_rows(mut reopen: impl FnMut() -> Result<Input, String>) -> Result<De
         return Ok(Decoded { width: w, height: h, icc, rows: Box::new(RectRows { dec, width: w, height: h, y: 0, ct }), streaming: true });
     }
 
-    // JPEG, WebP and anything else: decoded at once.
+    // WebP and anything else: decoded at once.
     full_decode(input, MAX_FULL_PIXELS)
 }
 
@@ -567,6 +826,120 @@ mod tests {
             // Memory stays bounded: level 0 never holds more than ~a tile row.
             assert!(b.bands[0].rows.len() <= grid.cy as usize + 2 * GUTTER as usize + 2);
         }
+    }
+
+    fn open_bytes(buf: Vec<u8>) -> Decoded {
+        let data: std::sync::Arc<[u8]> = buf.into();
+        open_rows(move || Ok(BufReader::new(Box::new(std::io::Cursor::new(data.clone())) as Box<dyn ReadSeek>))).unwrap()
+    }
+
+    fn read_all(d: &mut Decoded, chunk: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        while d.rows.read(chunk, &mut out).unwrap() > 0 {}
+        out
+    }
+
+    #[test]
+    fn baseline_jpeg_streams_and_matches_full_decode() {
+        use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
+        // Odd sizes; colourful content so chroma up-sampling matters.
+        let (w, h) = (517u16, 263u16);
+        let img = test_image(w as u32, h as u32);
+        let gray: Vec<u8> = img.pixels().map(|p| p.0[0]).collect();
+        let cases = [
+            ("4:2:0", Some(SamplingFactor::R_4_2_0)),
+            ("4:2:2", Some(SamplingFactor::R_4_2_2)),
+            ("4:4:4", Some(SamplingFactor::R_4_4_4)),
+            ("4:4:0", Some(SamplingFactor::R_4_4_0)),
+            ("grey", None),
+        ];
+        for (name, sampling) in cases {
+            let mut jpeg = Vec::new();
+            let mut enc = Encoder::new(&mut jpeg, 90);
+            match sampling {
+                Some(s) => {
+                    enc.set_sampling_factor(s);
+                    enc.encode(img.as_raw(), w, h, ColorType::Rgb).unwrap();
+                }
+                None => enc.encode(&gray, w, h, ColorType::Luma).unwrap(),
+            }
+            // Reference: zune-jpeg's own full decode to RGB.
+            let opts = zune_jpeg::zune_core::options::DecoderOptions::default()
+                .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGB);
+            let reference = zune_jpeg::JpegDecoder::new_with_options(zune_jpeg::zune_core::bytestream::ZCursor::new(&jpeg), opts)
+                .decode()
+                .unwrap();
+            let mut d = open_bytes(jpeg);
+            assert!(d.streaming, "{name}: not streamed");
+            let got = read_all(&mut d, 7);
+            assert_eq!(got.len(), reference.len(), "{name}");
+            let max = got.iter().zip(&reference).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            let differing = got.iter().zip(&reference).filter(|(a, b)| a != b).count();
+            // The raw rows are already rounded to 8 bits before up-sampling,
+            // the full decoder up-samples the 16-bit IDCT output: a few
+            // chroma-interpolated values differ by one.
+            assert!(max <= 1 && differing * 500 < got.len(), "{name}: max difference {max}, {differing} values differ");
+        }
+    }
+
+    /// `cargo test --release jpeg_row_speed -- --ignored --nocapture` with
+    /// `RUSTYPANO_BENCH_JPEG=<file>`.
+    #[test]
+    #[ignore]
+    fn jpeg_row_speed() {
+        let Ok(path) = std::env::var("RUSTYPANO_BENCH_JPEG") else { return };
+        let t = std::time::Instant::now();
+        let mut d = open_rows(|| Ok(BufReader::new(Box::new(std::fs::File::open(&path).unwrap()) as Box<dyn ReadSeek>))).unwrap();
+        let mut out = Vec::new();
+        let mut rows = 0;
+        loop {
+            out.clear();
+            let n = d.rows.read(139, &mut out).unwrap();
+            if n == 0 {
+                break;
+            }
+            rows += n;
+        }
+        println!("{rows} rows ({}x{}, streaming {}) in {:.2}s", d.width, d.height, d.streaming, t.elapsed().as_secs_f64());
+        // Compare a band of rows with both full decoders.
+        let (y0, n) = (d.height as usize / 2, 64usize);
+        let mut d = open_rows(|| Ok(BufReader::new(Box::new(std::fs::File::open(&path).unwrap()) as Box<dyn ReadSeek>))).unwrap();
+        let mut band = Vec::new();
+        let mut skip = Vec::new();
+        let mut y = 0;
+        while y < y0 {
+            skip.clear();
+            y += d.rows.read((y0 - y).min(256), &mut skip).unwrap();
+        }
+        d.rows.read(n, &mut band).unwrap();
+        let row = d.width as usize * 3;
+        let data = std::fs::read(&path).unwrap();
+        let opts = zune_jpeg::zune_core::options::DecoderOptions::default()
+            .set_max_width(1 << 16)
+            .set_max_height(1 << 16)
+            .jpeg_set_out_colorspace(zune_jpeg::zune_core::colorspace::ColorSpace::RGB);
+        let rc = zune_jpeg::JpegDecoder::new_with_options(zune_jpeg::zune_core::bytestream::ZCursor::new(&data), opts).decode().unwrap();
+        let mut reader = image::ImageReader::new(std::io::Cursor::new(&data)).with_guessed_format().unwrap();
+        reader.no_limits();
+        let img = reader.decode().unwrap().into_rgb8();
+        for (name, full) in [("zune-jpeg rc", &rc[..]), ("image (zune-jpeg 0.5.15)", img.as_raw())] {
+            let reference = &full[y0 * row..(y0 + n) * row];
+            let max = band.iter().zip(reference).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
+            let diff = band.iter().zip(reference).filter(|(a, b)| a != b).count();
+            println!("vs {name}: max difference {max}, {diff} of {} values differ", band.len());
+        }
+    }
+
+    #[test]
+    fn progressive_jpeg_falls_back_to_full_decode() {
+        let img = test_image(120, 60);
+        let mut jpeg = Vec::new();
+        let mut enc = jpeg_encoder::Encoder::new(&mut jpeg, 90);
+        enc.set_progressive(true);
+        enc.encode(img.as_raw(), 120, 60, jpeg_encoder::ColorType::Rgb).unwrap();
+        let mut d = open_bytes(jpeg);
+        assert!(!d.streaming);
+        assert_eq!(read_all(&mut d, 16).len(), 120 * 60 * 3);
     }
 
     #[test]

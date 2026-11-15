@@ -69,8 +69,8 @@ Storage (per tab, deleted when the tab is closed; anything a closed tab could
 not delete in time is removed the next time the page is opened). Not available in the
 browser: previous/next image in folder, recent files, saving Photo Sphere tags
 into files and display ICC profiles from files. Size limits in the browser:
-300 megapixels for JPEG and WebP (decoded as a whole), 2 gigapixels for PNG,
-TIFF, JPEG XL and BMP (read in stripes).
+300 megapixels for progressive JPEG and WebP (decoded as a whole), 2 gigapixels
+for baseline JPEG, PNG, TIFF, JPEG XL and BMP (read in stripes).
 
 ## Controls
 
@@ -122,9 +122,15 @@ with adjustable speed).
 Panoramas are shown in multiple resolutions from a tile cache, so neither the
 GPU nor main memory has to hold the whole image:
 
-- **Reading** (`src/pyramid.rs`): PNG, TIFF (strips or tiles), JPEG XL and BMP
-  are decoded stripe by stripe. JPEG and WebP decoders can only produce the
-  whole image; it is handed on row by row and freed right afterwards.
+- **Reading** (`src/pyramid.rs`): baseline JPEG, PNG, TIFF (strips or tiles),
+  JPEG XL and BMP are decoded stripe by stripe. Progressive JPEG needs all DCT
+  coefficients before the first row, and WebP is limited to 16383 px per side
+  anyway, so those are decoded as a whole, handed on row by row and freed
+  right afterwards. Streaming JPEG uses the iMCU-row API of
+  `zune-jpeg 0.5.16-rc3`, taken from its Git repository: as a pre-release it
+  cannot share the `zune-jpeg 0.5.x` from crates.io that `image` and `tiff`
+  use, but a different source may sit next to it. Switch to the crates.io
+  release once 0.5.16 is out.
 - **Building tiles:** each stripe is colour-managed (ICC → sRGB or display
   profile) and fed into a streaming pyramid builder. For every level (full
   size, half, quarter, …; gamma-correct 2× downscaling) it keeps only a band of

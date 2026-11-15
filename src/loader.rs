@@ -378,12 +378,16 @@ async fn build_tiles(
     let mut rows = Vec::with_capacity(batch * w as usize * 3);
     let mut done = 0usize;
     let mut bytes = 0u64;
+    // Time spent per step, logged at the end.
+    let (mut t_read, mut t_build, mut t_store) = (0f64, 0f64, 0f64);
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
         rows.clear();
+        let t = Instant::now();
         let n = decoded.rows.read(batch, &mut rows)?;
+        t_read += t.elapsed().as_secs_f64();
         if n == 0 {
             break;
         }
@@ -391,10 +395,14 @@ async fn build_tiles(
             let per = n.div_ceil(threads()).max(1) * w as usize * 3;
             par_chunks(&mut rows, per, |c, _| xf.apply(c));
         }
+        let t = Instant::now();
         builder.push_rows(&rows, &lut);
         let tiles = builder.take_tiles();
+        t_build += t.elapsed().as_secs_f64();
         if !tiles.is_empty() {
+            let t = Instant::now();
             bytes += store_tiles(&building.store, tiles, &grid, cancel).await?;
+            t_store += t.elapsed().as_secs_f64();
         }
         done += n;
         progress.store(50 + (850 * done as u64 / h as u64) as u32, Ordering::Relaxed);
@@ -402,6 +410,7 @@ async fn build_tiles(
         yield_now().await;
     }
     drop(decoded);
+    log::info!("Tiles built: decoding {t_read:.2} s, pyramid {t_build:.2} s, encoding and storing {t_store:.2} s");
     if !builder.is_complete() {
         return Err(tr!("Cannot decode this image: {error}", error = "image data ended early"));
     }

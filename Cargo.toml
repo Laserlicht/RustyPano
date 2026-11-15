@@ -17,6 +17,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 tiff = "0.11.3"
 toml = "1.2.1"
 web-time = "1.1.0"
+zune-jpeg = { git = "https://github.com/etemesi254/zune-image", rev = "fa80e24b17ff388ac850d6042bdca391f9913c4e", version = "0.5.16-rc3" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dirs = "7.0.0"
