@@ -385,6 +385,14 @@ pub struct TileCache {
     frame: u64,
     last_view: Option<[f64; 5]>,
     needed: Vec<TileId>,
+    /// View motion, for loading tiles before they come into view.
+    motion: Motion,
+    /// Number of tiles at the start of `needed` that are visible right now.
+    visible_count: usize,
+    /// Frames drawn, and frames where a visible tile was still missing (so a
+    /// coarser level was shown); logged when the panorama is closed.
+    frames_drawn: u64,
+    frames_missing: u64,
     #[cfg(not(target_arch = "wasm32"))]
     requests: Option<mpsc::Sender<TileId>>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -429,6 +437,10 @@ impl TileCache {
             frame: 0,
             last_view: None,
             needed: Vec::new(),
+            motion: Motion::default(),
+            visible_count: 0,
+            frames_drawn: 0,
+            frames_missing: 0,
             #[cfg(not(target_arch = "wasm32"))]
             requests: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -528,12 +540,20 @@ impl TileCache {
     pub fn update(&mut self, view: &View, queue: &wgpu::Queue) -> bool {
         self.frame += 1;
         let key = [view.yaw, view.pitch, view.hfov, view.vw, view.vh];
-        if self.last_view != Some(key) {
+        let was_moving = self.motion.is_moving(view);
+        self.motion.track(view);
+        // Re-plan when the view changed, and once more when it came to rest so
+        // the look-ahead tiles are dropped.
+        if self.last_view != Some(key) || was_moving {
             self.last_view = Some(key);
             let capacity = (self.gpu.slots - self.pinned) as usize;
-            self.needed = visible_tiles(view, &self.gpu.grid, self.gpu.width, self.gpu.height);
-            self.needed.retain(|t| t.level as usize != self.gpu.grid.base());
-            self.needed.truncate(capacity);
+            let motion = if prefetch_enabled() { self.motion } else { Motion::default() };
+            (self.needed, self.visible_count) =
+                plan_tiles(view, &motion, &self.gpu.grid, self.gpu.width, self.gpu.height, capacity);
+        }
+        self.frames_drawn += 1;
+        if self.needed[..self.visible_count].iter().any(|t| !self.resident.contains_key(t)) {
+            self.frames_missing += 1;
         }
         let mut missing = Vec::new();
         for t in &self.needed {
@@ -613,6 +633,120 @@ impl TileCache {
         #[cfg(not(target_arch = "wasm32"))]
         !self.pending.is_empty()
     }
+}
+
+/// Smoothed speed of the view, measured between frames.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Motion {
+    last: Option<(web_time::Instant, f64, f64, f64)>,
+    /// Degrees per second.
+    pub yaw: f64,
+    pub pitch: f64,
+    /// Change of ln(hfov) per second (negative: zooming in).
+    pub zoom: f64,
+}
+
+impl Motion {
+    pub fn track(&mut self, view: &View) {
+        self.track_at(view, web_time::Instant::now());
+    }
+
+    fn track_at(&mut self, view: &View, now: web_time::Instant) {
+        let cur = (now, view.yaw, view.pitch, view.hfov.ln());
+        if let Some((t, yaw, pitch, lh)) = self.last {
+            let dt = now.duration_since(t).as_secs_f64();
+            if dt > 0.25 {
+                // First frame after a pause: no speed yet.
+                *self = Motion { last: Some(cur), ..Default::default() };
+                return;
+            }
+            if dt > 1e-4 {
+                let mut dyaw = view.yaw - yaw;
+                if dyaw > 180.0 {
+                    dyaw -= 360.0;
+                } else if dyaw < -180.0 {
+                    dyaw += 360.0;
+                }
+                // Exponential smoothing with a time constant of ~0.1 s.
+                let a = (dt / 0.1).min(1.0);
+                self.yaw += a * (dyaw / dt - self.yaw);
+                self.pitch += a * ((view.pitch - pitch) / dt - self.pitch);
+                self.zoom += a * ((cur.3 - lh) / dt - self.zoom);
+            }
+        }
+        self.last = Some(cur);
+    }
+
+    /// Fast enough for looking ahead to pay off.
+    pub fn is_moving(&self, view: &View) -> bool {
+        let pan = self.yaw.hypot(self.pitch) / view.hfov.max(1e-6);
+        pan > 0.02 || self.zoom.abs() > 0.02
+    }
+
+    /// Where the view will be in `t` seconds at the current speed. The
+    /// distance is capped so a quick flick does not request half the sphere.
+    pub fn predict(&self, view: &View, t: f64) -> View {
+        let mut v = *view;
+        let reach = 0.75 * view.hfov;
+        let scale = (reach / (self.yaw.hypot(self.pitch) * t).max(1e-9)).min(1.0);
+        v.set_hfov(view.hfov * (self.zoom * t).clamp(-0.7, 0.7).exp());
+        v.set_pitch(view.pitch + self.pitch * t * scale);
+        v.set_yaw(view.yaw + self.yaw * t * scale);
+        v
+    }
+}
+
+/// `RUSTYPANO_NO_PREFETCH` turns look-ahead off (for comparisons).
+fn prefetch_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RUSTYPANO_NO_PREFETCH").is_none())
+}
+
+impl Drop for TileCache {
+    fn drop(&mut self) {
+        if self.frames_drawn > 0 {
+            log::info!(
+                "{} of {} frames showed a visible tile at a coarser level",
+                self.frames_missing,
+                self.frames_drawn
+            );
+        }
+    }
+}
+
+/// Look-ahead times for prefetching, in seconds.
+const LOOK_AHEAD: [f64; 3] = [0.25, 0.5, 0.8];
+
+/// Tiles to keep in the GPU cache: everything visible now (coarse levels and
+/// the centre first), then the tiles of where the view is heading. The list is
+/// cut to `capacity` so prefetching never displaces visible tiles. Also
+/// returns how many of the tiles are visible now.
+pub fn plan_tiles(
+    view: &View,
+    motion: &Motion,
+    grid: &TileGrid,
+    width: u32,
+    height: u32,
+    capacity: usize,
+) -> (Vec<TileId>, usize) {
+    let base = grid.base();
+    let mut tiles: Vec<TileId> = visible_tiles(view, grid, width, height)
+        .into_iter()
+        .filter(|t| t.level as usize != base)
+        .collect();
+    let visible = tiles.len().min(capacity);
+    if motion.is_moving(view) {
+        let mut seen: HashSet<TileId> = tiles.iter().copied().collect();
+        for t in LOOK_AHEAD {
+            for tile in visible_tiles(&motion.predict(view, t), grid, width, height) {
+                if tile.level as usize != base && seen.insert(tile) {
+                    tiles.push(tile);
+                }
+            }
+        }
+    }
+    tiles.truncate(capacity);
+    (tiles, visible)
 }
 
 /// Tiles needed to draw `view` at the resolution the screen needs, coarse
@@ -707,6 +841,55 @@ mod tests {
         img.put_pixel(1, 1, image::Rgb([255, 255, 255]));
         // Half white, half black averages to linear 0.5 = sRGB 188, not 128.
         assert_eq!(halve(&img, &lut).get_pixel(0, 0).0[0], 188);
+    }
+
+    #[test]
+    fn prefetches_in_the_direction_of_motion() {
+        let (w, h) = (20000, 10000);
+        let g = TileGrid::new(w, h);
+        let mut v = View::new(PanoGeometry::new(w, h, None));
+        v.set_viewport(1920.0, 1080.0);
+        v.set_hfov(40.0);
+        v.set_yaw(180.0);
+        // Pan right at half a field of view per second.
+        let mut m = Motion::default();
+        let t0 = web_time::Instant::now();
+        for i in 0..40 {
+            let mut f = v;
+            f.set_yaw(180.0 + 20.0 * i as f64 * 0.016);
+            m.track_at(&f, t0 + std::time::Duration::from_millis(16 * i));
+        }
+        assert!((m.yaw - 20.0).abs() < 2.0, "measured {}", m.yaw);
+        assert!(m.is_moving(&v));
+
+        let (still, nv) = plan_tiles(&v, &Motion::default(), &g, w, h, 1000);
+        let (moving, mv) = plan_tiles(&v, &m, &g, w, h, 1000);
+        assert_eq!((nv, mv), (still.len(), still.len()));
+        assert_eq!(&moving[..still.len()], &still[..], "visible tiles come first");
+        let extra = &moving[still.len()..];
+        assert!(!extra.is_empty(), "nothing prefetched");
+        // The extra tiles lie to the right (increasing yaw) of the view.
+        let l = g.levels[extra[0].level as usize];
+        let yaw_of = |t: &TileId| (t.tx as f64 + 0.5) * g.cx as f64 / l.w as f64 * 360.0;
+        assert!(extra.iter().all(|t| yaw_of(t) > 180.0), "{extra:?}");
+        // Prefetching never pushes visible tiles out.
+        let (capped, _) = plan_tiles(&v, &m, &g, w, h, still.len());
+        assert_eq!(capped, still);
+    }
+
+    #[test]
+    fn motion_resets_after_a_pause() {
+        let mut v = View::new(PanoGeometry::new(8000, 4000, None));
+        v.set_viewport(1000.0, 800.0);
+        let mut m = Motion::default();
+        let t0 = web_time::Instant::now();
+        m.track_at(&v, t0);
+        v.set_yaw(v.yaw + 1.0);
+        m.track_at(&v, t0 + std::time::Duration::from_millis(16));
+        assert!(m.yaw > 0.0);
+        m.track_at(&v, t0 + std::time::Duration::from_secs(2));
+        assert_eq!(m.yaw, 0.0);
+        assert!(!m.is_moving(&v));
     }
 
     #[test]

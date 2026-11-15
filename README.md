@@ -147,6 +147,9 @@ GPU nor main memory has to hold the whole image:
   Every frame the visible tiles at the needed resolution are worked out on the
   CPU, missing ones are loaded from the tile cache (by worker threads; in the
   browser asynchronously) and the least recently used ones are evicted.
+  While the view pans or zooms, its speed is measured and the tiles for where
+  it will be in 0.25, 0.5 and 0.8 s are loaded too (after the visible ones, at
+  most ¾ of a view ahead), so moving does not briefly show a coarser level.
 - **Shader** (`src/pano.wgsl`): casts a ray per screen pixel, converts it to
   longitude/latitude, picks the pyramid level from screen-space derivatives,
   looks the tile up in the page table (falling back to coarser levels while
@@ -193,7 +196,10 @@ catalog file.
 | `src/web.rs` | browser glue (fetch, local storage, fullscreen, startup screen) |
 | `build.rs`, `packaging/`, `.github/workflows/` | Windows icon, AppImage/macOS/web packaging, CI |
 
-Debug aids: `RUSTYPANO_SCREENSHOT=out.png` saves one rendered frame and quits;
+Debug aids: `RUSTYPANO_SCREENSHOT=out.png` saves one rendered frame and quits
+(`RUSTYPANO_SCREENSHOT_FRAMES=n` after n frames even while moving);
+`RUSTYPANO_NO_PREFETCH=1` turns look-ahead loading off; with `RUST_LOG=info`
+the app logs how many frames had to show a coarser level;
 `RUSTYPANO_GRID=1`, `RUSTYPANO_INTERP=nearest|bilinear|bicubic|lanczos` and
 `RUSTYPANO_DIALOG=options|metadata|hotspots|view|about` set up that frame.
 

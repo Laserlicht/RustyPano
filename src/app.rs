@@ -1642,7 +1642,10 @@ impl RustyPanoApp {
         let Some((path, frames)) = &mut self.screenshot else { return };
         *frames += 1;
         let steady = self.last_motion.elapsed().as_secs_f32() > 0.4 && !self.tiles_streaming;
-        if ((*frames >= 20 && steady) || *frames == 150) && *frames < 1_000_000 {
+        // RUSTYPANO_SCREENSHOT_FRAMES: take the screenshot after this many
+        // frames even if the view keeps moving (default 150).
+        let max_frames: u32 = std::env::var("RUSTYPANO_SCREENSHOT_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(150);
+        if ((*frames >= 20 && steady && max_frames == 150) || *frames == max_frames) && *frames < 1_000_000 {
             *frames = 1_000_000;
             let path = path.clone();
             let c2 = ctx.clone();
