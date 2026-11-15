@@ -2,21 +2,30 @@
 // Copyright (c) 2026 RustyPano contributors
 
 // Equirectangular → rectilinear reprojection, evaluated per screen pixel.
+//
+// The panorama is a pyramid of resolution levels cut into tiles. Resident
+// tiles live in the layers ("slots") of `tex`; the page table maps
+// (level, tile) to slot + 1 (0 = not resident). Each pixel uses the level its
+// footprint needs and falls back to coarser levels until a resident tile is
+// found; the coarsest level is always resident.
 
 struct U {
     vp: vec4f,        // viewport origin (px), viewport size (px)
-    img: vec4f,       // image W, H (gpu pixels), horizon row, focal length (px)
-    cam: vec4f,       // yaw, pitch (radians), tile content, gutter
-    tiles: vec4f,     // tile size, tiles_x, tiles_y, max lod
-    flags: vec4u,     // interpolator, encode sRGB on output, grid flags, has image
+    img: vec4f,       // full-resolution W, H, horizon row, focal length (px)
+    cam: vec4f,       // yaw, pitch (radians), gutter, max in-slot lod
+    tile: vec4f,      // tile content cx, cy; slot size sx, sy
+    flags: vec4u,     // interpolator, encode sRGB on output, grid flags, base level
     grid: vec4f,      // rows distance (deg), columns distance (deg), line width (px), _
     grid_color: vec4f,
     bg: vec4f,
+    // Per level: (nx | ny << 16, first page-table row, width, height).
+    levels: array<vec4u, 16>,
 };
 
 @group(0) @binding(0) var<uniform> u: U;
 @group(0) @binding(1) var tex: texture_2d_array<f32>;
 @group(0) @binding(2) var samp_lin: sampler;
+@group(0) @binding(3) var page_table: texture_2d<u32>;
 
 const PI: f32 = 3.14159265358979;
 const TAU: f32 = 6.28318530717959;
@@ -34,16 +43,21 @@ fn to_srgb(c: vec3f) -> vec3f {
 }
 
 struct TileCoord {
-    local: vec2f, // level-0 pixel position inside the tile texture (includes gutter)
-    layer: i32,
+    local: vec2f, // pixel position inside the slot at its level (includes gutter)
+    layer: i32,   // slot, or -1 if the tile is not resident
 };
 
-fn tile_coord(g: vec2f) -> TileCoord {
-    let c = u.cam.z;
-    let t = clamp(floor(g / c), vec2f(0.0), vec2f(u.tiles.y - 1.0, u.tiles.z - 1.0));
+// Tile of pyramid level `k` under full-resolution pixel `g`.
+fn lookup(k: u32, g: vec2f) -> TileCoord {
+    let l = u.levels[k];
+    let n = vec2f(f32(l.x & 0xffffu), f32(l.x >> 16u));
+    let gk = g * vec2f(f32(l.z) / u.img.x, f32(l.w) / u.img.y);
+    let c = u.tile.xy;
+    let t = clamp(floor(gk / c), vec2f(0.0), n - 1.0);
+    let v = textureLoad(page_table, vec2i(i32(t.x), i32(l.y) + i32(t.y)), 0).r;
     var r: TileCoord;
-    r.local = g - t * c + vec2f(u.cam.w);
-    r.layer = i32(t.y * u.tiles.y + t.x);
+    r.local = gk - t * c + vec2f(u.cam.z);
+    r.layer = i32(v) - 1;
     return r;
 }
 
@@ -138,31 +152,49 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     let deg_lat = degrees(max(abs(dlatx), abs(dlaty)));
     let deg_lon = degrees(max(abs(dlx), abs(dly)));
 
-    if (u.flags.w == 0u || gy < 0.0 || gy >= u.img.y) {
+    if (gy < 0.0 || gy >= u.img.y) {
         return u.bg;
     }
 
-    let tc = tile_coord(vec2f(gx, gy));
-    let uv = tc.local / u.tiles.x;
-    let max_lod = u.tiles.w;
-    let lodc = clamp(lod, 0.0, max_lod);
+    // Finest resident level at or above the one the footprint asks for.
+    let base = u.flags.w;
+    let g = vec2f(gx, gy);
+    var k = u32(clamp(floor(lod), 0.0, f32(base)));
+    var tc = lookup(k, g);
+    for (var i = 0u; i < 16u; i++) {
+        if (tc.layer >= 0 || k >= base) {
+            break;
+        }
+        k += 1u;
+        tc = lookup(k, g);
+    }
+    if (tc.layer < 0) {
+        return u.bg;
+    }
+
+    // Level of detail relative to the tile's own resolution: inside [0, 1)
+    // when the wanted level is resident, below 0 while a finer one streams in.
+    let rel = lod - f32(k);
+    let max_lod = u.cam.w;
+    let rel_c = clamp(rel, 0.0, max_lod);
+    let uv = tc.local / u.tile.zw;
     var col: vec3f;
     switch u.flags.x {
         case 0u: {
-            let lvl = i32(round(lodc));
+            let lvl = i32(round(rel_c));
             let ip = vec2i(floor(tc.local / exp2(f32(lvl))));
             col = textureLoad(tex, ip, tc.layer, lvl).rgb;
         }
         case 2u, 3u: {
             let lanczos = u.flags.x == 3u;
-            // Kernels reach ±3 texels: the gutter allows them up to level 3.
-            if (lod > 3.0) {
-                col = textureSampleLevel(tex, samp_lin, uv, tc.layer, lodc).rgb;
-            } else if (lod <= 0.0) {
+            // Kernels reach ±3 texels: the gutter allows them up to slot mip 3.
+            if (rel > 3.0) {
+                col = textureSampleLevel(tex, samp_lin, uv, tc.layer, rel_c).rgb;
+            } else if (rel <= 0.0) {
                 col = sample_kernel(tc, 0, lanczos);
             } else {
-                let l0 = i32(floor(lod));
-                let fr = lod - f32(l0);
+                let l0 = i32(floor(rel));
+                let fr = rel - f32(l0);
                 let a = sample_kernel(tc, l0, lanczos);
                 if (fr < 0.02) {
                     col = a;
@@ -172,7 +204,7 @@ fn fs_main(@builtin(position) pos: vec4f) -> @location(0) vec4f {
             }
         }
         default: {
-            col = textureSampleLevel(tex, samp_lin, uv, tc.layer, lodc).rgb;
+            col = textureSampleLevel(tex, samp_lin, uv, tc.layer, rel_c).rgb;
         }
     }
 

@@ -196,6 +196,22 @@ impl View {
         (r, u, f)
     }
 
+    /// Like [`Self::screen_to_angles`], with the camera set up once for
+    /// mapping many points.
+    pub fn screen_mapper(&self) -> impl Fn(f64, f64) -> (f64, f64) {
+        let (r, u, f) = self.basis();
+        let (fl, cx, cy) = (self.focal(), self.vw * 0.5, self.vh * 0.5);
+        move |sx, sy| {
+            let (x, y) = (sx - cx, -(sy - cy));
+            let d = [
+                r[0] * x + u[0] * y + f[0] * fl,
+                r[1] * x + u[1] * y + f[1] * fl,
+                r[2] * x + u[2] * y + f[2] * fl,
+            ];
+            (d[0].atan2(d[2]).to_degrees().rem_euclid(360.0), d[1].atan2(d[0].hypot(d[2])).to_degrees())
+        }
+    }
+
     /// Screen pixel (relative to the viewport's top-left) → (yaw, pitch).
     pub fn screen_to_angles(&self, sx: f64, sy: f64) -> (f64, f64) {
         let (r, u, f) = self.basis();

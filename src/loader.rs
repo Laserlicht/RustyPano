@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 RustyPano contributors
 
-//! Loading: read → decode → colour-manage → split into GPU tiles with
-//! gutters → build mipmaps → upload into one `texture_2d_array`.
-//!
-//! Panoramas are usually far bigger than the GPU's maximum texture size, so the
-//! equirectangular image is cut into square tiles of `tile_content` pixels,
-//! each stored in an array layer of `tile_size = tile_content + 2*GUTTER`
-//! pixels. The gutter holds real neighbouring pixels (wrapping horizontally,
-//! clamped vertically), so filtering never shows seams up to mip level
-//! `MAX_LOD`.
+//! Loading: read → decode → colour-manage → build the resolution pyramid →
+//! allocate the GPU tile cache and upload the coarsest level. Finer tiles are
+//! streamed in while viewing (see `tiles.rs`).
 //!
 //! The pipeline is one async function. Natively it runs on a background thread
 //! (and uses worker threads for the heavy parts); in the browser it runs on the
@@ -27,30 +21,12 @@ use web_time::Instant;
 use crate::fsv::{PanoParams, decode_text};
 use crate::settings::{MonitorProfile, Settings};
 use crate::source::Source;
+use crate::tiles::{GpuTiles, Lut, Pyramid, TileCache, TileGrid};
 use crate::xmp::GPano;
 
-pub const GUTTER: u32 = 32;
-pub const MIP_LEVELS: u32 = 6; // levels 0..=5; gutter is 1 texel at level 5
-pub const MAX_LOD: u32 = MIP_LEVELS - 1;
-const MAX_TILE: u32 = 4096;
 /// The browser build has a 4 GB address space; refuse images that cannot fit.
 #[cfg(target_arch = "wasm32")]
 const MAX_WEB_PIXELS: u64 = 300_000_000;
-
-static NEXT_ID: AtomicU32 = AtomicU32::new(1);
-
-pub struct GpuPano {
-    pub id: u32,
-    pub view: wgpu::TextureView,
-    _texture: wgpu::Texture,
-    /// Size of the image stored on the GPU (may be downscaled).
-    pub gpu_width: u32,
-    pub gpu_height: u32,
-    pub tile_size: u32,
-    pub tile_content: u32,
-    pub tiles_x: u32,
-    pub tiles_y: u32,
-}
 
 pub struct LoadedPano {
     /// What was opened: the image itself or the tour file.
@@ -59,8 +35,8 @@ pub struct LoadedPano {
     pub gpano: GPano,
     pub width: u32,
     pub height: u32,
-    pub gpu: Arc<GpuPano>,
-    pub downscale: u32,
+    /// Multi-resolution tiles: CPU pyramid plus the GPU cache.
+    pub tiles: TileCache,
     pub icc_used: Option<String>,
     pub load_time: f32,
 }
@@ -136,22 +112,23 @@ async fn yield_now() {
     crate::web::yield_now().await;
 }
 
-/// Run `f` over chunks of `data` in parallel where threads are available.
-fn par_chunks(data: &mut [u8], chunk: usize, f: impl Fn(&mut [u8]) + Sync) {
+/// Run `f(chunk, offset)` over chunks of `data` in parallel where threads
+/// are available.
+pub(crate) fn par_chunks(data: &mut [u8], chunk: usize, f: impl Fn(&mut [u8], usize) + Sync) {
     #[cfg(not(target_arch = "wasm32"))]
     std::thread::scope(|s| {
-        for c in data.chunks_mut(chunk) {
+        for (i, c) in data.chunks_mut(chunk).enumerate() {
             let f = &f;
-            s.spawn(move || f(c));
+            s.spawn(move || f(c, i * chunk));
         }
     });
     #[cfg(target_arch = "wasm32")]
-    for c in data.chunks_mut(chunk) {
-        f(c);
+    for (i, c) in data.chunks_mut(chunk).enumerate() {
+        f(c, i * chunk);
     }
 }
 
-fn threads() -> usize {
+pub(crate) fn threads() -> usize {
     #[cfg(not(target_arch = "wasm32"))]
     return std::thread::available_parallelism().map_or(4, |n| n.get());
     #[cfg(target_arch = "wasm32")]
@@ -265,361 +242,124 @@ async fn load(
             {
                 let row = width as usize * 3;
                 let rows_per = (height as usize).div_ceil(threads()).max(1);
-                par_chunks(&mut rgb, rows_per * row, |c| xf.apply(c));
+                par_chunks(&mut rgb, rows_per * row, |c, _| xf.apply(c));
                 icc_used = Some(if icc.is_some() { tr!("embedded ICC").into() } else { tr!("sRGB (assumed)").into() });
             }
         }
     }
     progress.store(250, Ordering::Relaxed);
 
-    // ---- fit into the GPU budget, upload, verify ----------------------------
-    let limits = device.limits();
-    let max_tile = MAX_TILE.min(limits.max_texture_dimension_2d);
-    let max_layers = limits.max_texture_array_layers;
-    let budget = settings.max_gpu_memory_mb.max(256) as u64 * 1024 * 1024;
-    let mut downscale = 1u32;
-    let (mut gw, mut gh) = (width, height);
-    let (texture, layout) = loop {
-        let layout = TileLayout::new(gw, gh, max_tile);
-        let bytes = layout.tile_size as u64 * layout.tile_size as u64 * 4 * 4 / 3 * layout.layers() as u64;
-        if (layout.layers() > max_layers || bytes > budget) && gw >= 1024 {
-            set_stage(tr!("Downscaling"));
-            yield_now().await;
-            rgb = halve(&rgb);
-            downscale *= 2;
-            (gw, gh) = (rgb.width(), rgb.height());
-            continue;
-        }
-        set_stage(tr!("Uploading to GPU"));
-        let tex = upload(&rgb, &layout, device, queue, progress, cancel, ctx).await;
-        if cancelled() {
-            return Err("cancelled".into());
-        }
-        if verify(&tex, &rgb, &layout, device, queue) || gw < 1024 {
-            break (tex, layout);
+    // ---- resolution pyramid ----------------------------------------------------
+    set_stage(tr!("Building resolution levels"));
+    yield_now().await;
+    let grid = TileGrid::new(width, height);
+    let lut = Lut::new();
+    let levels = grid.levels.len();
+    let pyramid = Pyramid::build(rgb, &grid, &lut, |i| {
+        progress.store(250 + (450 * i / levels) as u32, Ordering::Relaxed);
+        ctx.request_repaint();
+    });
+    if cancelled() {
+        return Err("cancelled".into());
+    }
+    progress.store(700, Ordering::Relaxed);
+
+    // ---- GPU tile cache ------------------------------------------------------
+    set_stage(tr!("Uploading to GPU"));
+    yield_now().await;
+    let max_layers = device.limits().max_texture_array_layers;
+    let mut budget = settings.max_gpu_memory_mb.max(64) as u64 * 1024 * 1024;
+    let mut slots = grid.slots_for_budget(budget, max_layers);
+    let gpu = loop {
+        let gpu = GpuTiles::allocate(device, grid.clone(), width, height, slots);
+        if verify(&gpu, device, queue) {
+            break gpu;
         }
         // Some drivers (notably OpenGL) fail texture allocation silently when
-        // out of video memory: the readback did not match, so try again smaller.
-        log::warn!("GPU upload of {gw}x{gh} failed verification (out of video memory?), downscaling");
-        tex.destroy();
-        drop(tex);
-        set_stage(tr!("Downscaling"));
-        rgb = halve(&rgb);
-        downscale *= 2;
-        (gw, gh) = (rgb.width(), rgb.height());
+        // out of video memory: the readback did not match, so use fewer slots.
+        budget /= 2;
+        let fewer = grid.slots_for_budget(budget, max_layers);
+        log::warn!("GPU tile cache with {slots} slots failed verification (out of video memory?), trying {fewer}");
+        gpu.texture.destroy();
+        if fewer >= slots {
+            break GpuTiles::allocate(device, grid.clone(), width, height, slots);
+        }
+        slots = fewer;
     };
-    if downscale > 1 {
-        log::info!("Panorama downscaled by {downscale} to fit the GPU ({gw}x{gh})");
-    }
+    log::info!(
+        "{width}x{height}: {} levels, tiles {}x{}, {} of {} tiles cached on the GPU ({} MB)",
+        grid.levels.len(),
+        grid.cx,
+        grid.cy,
+        slots,
+        grid.tile_count(),
+        (slots as u64 * grid.slot_bytes()) >> 20
+    );
+    let tiles = TileCache::new(gpu, pyramid, lut, queue, ctx);
+    progress.store(1000, Ordering::Relaxed);
 
-    let view = texture.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("pano tiles view"),
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        ..Default::default()
-    });
-    let gpu = Arc::new(GpuPano {
-        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        view,
-        _texture: texture,
-        gpu_width: gw,
-        gpu_height: gh,
-        tile_size: layout.tile_size,
-        tile_content: layout.tile_content,
-        tiles_x: layout.tiles_x,
-        tiles_y: layout.tiles_y,
-    });
     Ok(LoadedPano {
         source: source.clone(),
         params,
         gpano,
         width,
         height,
-        gpu,
-        downscale,
+        tiles,
         icc_used,
         load_time: t0.elapsed().as_secs_f32(),
     })
 }
 
-fn mip_levels_for(layout: &TileLayout) -> u32 {
-    MIP_LEVELS.min(32 - layout.tile_size.leading_zeros())
-}
-
-/// Build one tile with its mip chain and copy it into the texture layer.
-fn upload_tile(rgb: &image::RgbImage, layout: &TileLayout, layer: u32, texture: &wgpu::Texture, queue: &wgpu::Queue, lut: &Lut) {
-    let mip_levels = mip_levels_for(layout);
-    let (tx, ty) = (layer % layout.tiles_x, layer / layout.tiles_x);
-    let mut level = build_tile(rgb, rgb.width(), rgb.height(), layout, tx, ty);
-    let mut size = layout.tile_size;
-    for mip in 0..mip_levels {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: mip,
-                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
-                aspect: wgpu::TextureAspect::All,
-            },
-            &level,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(size * 4), rows_per_image: Some(size) },
-            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
-        );
-        if mip + 1 < mip_levels {
-            level = downsample_rgba(&level, size, lut);
-            size /= 2;
-        }
-    }
-}
-
-async fn upload(
-    rgb: &image::RgbImage,
-    layout: &TileLayout,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    progress: &AtomicU32,
-    cancel: &AtomicBool,
-    ctx: &eframe::egui::Context,
-) -> wgpu::Texture {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("pano tiles"),
-        size: wgpu::Extent3d {
-            width: layout.tile_size,
-            height: layout.tile_size,
-            depth_or_array_layers: layout.layers(),
-        },
-        mip_level_count: mip_levels_for(layout),
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-
-    let lut = Lut::new();
-    let n_tiles = layout.tiles_x * layout.tiles_y;
-    let report = |done: u32| {
-        progress.store(250 + 750 * done / n_tiles, Ordering::Relaxed);
-        ctx.request_repaint();
-    };
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let done = AtomicU32::new(0);
-        let next = AtomicU32::new(0);
-        // Each worker holds one tile (+ mips) at a time: ~90 MB at 4096².
-        let workers = threads().min(n_tiles as usize).clamp(1, 8);
-        std::thread::scope(|s| {
-            for _ in 0..workers {
-                s.spawn(|| {
-                    while !cancel.load(Ordering::Relaxed) {
-                        let layer = next.fetch_add(1, Ordering::Relaxed);
-                        if layer >= n_tiles {
-                            return;
-                        }
-                        upload_tile(rgb, layout, layer, &texture, queue, &lut);
-                        report(done.fetch_add(1, Ordering::Relaxed) + 1);
-                    }
-                });
-            }
-        });
-    }
-    #[cfg(target_arch = "wasm32")]
-    for layer in 0..n_tiles {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
-        upload_tile(rgb, layout, layer, &texture, queue, &lut);
-        report(layer + 1);
-        yield_now().await;
-    }
-    queue.submit([]);
-    texture
-}
-
 /// The browser cannot wait for a GPU readback; WebGPU reports allocation
 /// failures itself, so the check is skipped there.
 #[cfg(target_arch = "wasm32")]
-fn verify(_: &wgpu::Texture, _: &image::RgbImage, _: &TileLayout, _: &wgpu::Device, _: &wgpu::Queue) -> bool {
+fn verify(_: &GpuTiles, _: &wgpu::Device, _: &wgpu::Queue) -> bool {
     true
 }
 
-/// Read back a few texels of the last tile and compare them with the source.
+/// Write a texel into the last cache slot and read it back.
 #[cfg(not(target_arch = "wasm32"))]
-fn verify(
-    tex: &wgpu::Texture,
-    rgb: &image::RgbImage,
-    layout: &TileLayout,
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) -> bool {
-    let layer = layout.tiles_x * layout.tiles_y - 1;
-    let (tx, ty) = (layer % layout.tiles_x, layer / layout.tiles_x);
-    let (w, h) = (rgb.width() as i64, rgb.height() as i64);
-    let probes: Vec<(u32, u32)> = [(0u32, 0u32), (7, 3), (13, 29), (2, 17)]
-        .iter()
-        .map(|&(a, b)| (GUTTER + a, GUTTER + b))
-        .collect();
+fn verify(gpu: &GpuTiles, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+    let probe = [11u8, 222, 33, 255];
+    let layer = gpu.slots - 1;
+    let at = wgpu::TexelCopyTextureInfo {
+        texture: &gpu.texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d { x: 7, y: 5, z: layer },
+        aspect: wgpu::TextureAspect::All,
+    };
+    let one = wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 };
+    queue.write_texture(at, &probe, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: None }, one);
     let buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("verify readback"),
-        size: 256 * probes.len() as u64,
+        size: 256,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
     let mut enc = device.create_command_encoder(&Default::default());
-    for (i, &(x, y)) in probes.iter().enumerate() {
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x, y, z: layer },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &buf,
-                layout: wgpu::TexelCopyBufferLayout { offset: 256 * i as u64, bytes_per_row: Some(256), rows_per_image: None },
-            },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        );
-    }
+    enc.copy_texture_to_buffer(
+        at,
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buf,
+            layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: None },
+        },
+        one,
+    );
     queue.submit([enc.finish()]);
     let slice = buf.slice(..);
-    let (stx, srx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = stx.send(r.is_ok());
+        let _ = tx.send(r.is_ok());
     });
     let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(30)) });
-    if !srx.recv().unwrap_or(false) {
+    if !rx.recv().unwrap_or(false) {
         return false;
     }
     let Ok(data) = slice.get_mapped_range() else { return false };
-    let ok = probes.iter().enumerate().all(|(i, &(x, y))| {
-        let sx = ((tx * layout.tile_content + x - GUTTER) as i64).rem_euclid(w) as u32;
-        let sy = ((ty * layout.tile_content + y - GUTTER) as i64).clamp(0, h - 1) as u32;
-        let p = rgb.get_pixel(sx, sy).0;
-        data[256 * i..256 * i + 3] == p && data[256 * i + 3] == 255
-    });
+    let ok = data[..4] == probe;
     drop(data);
     buf.unmap();
     ok
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TileLayout {
-    tile_size: u32,
-    tile_content: u32,
-    tiles_x: u32,
-    tiles_y: u32,
-}
-
-impl TileLayout {
-    fn new(w: u32, h: u32, max_tile: u32) -> Self {
-        let align = 1 << MAX_LOD;
-        let max_content = (max_tile - 2 * GUTTER) / align * align;
-        let content = w.max(h).div_ceil(align).saturating_mul(align).min(max_content);
-        let tile_size = content + 2 * GUTTER;
-        Self { tile_size, tile_content: content, tiles_x: w.div_ceil(content), tiles_y: h.div_ceil(content) }
-    }
-    fn layers(&self) -> u32 {
-        let n = self.tiles_x * self.tiles_y;
-        // wgpu's GL backend infers the view type from the layer count: 1 layer
-        // means a plain 2D texture and multiples of 6 mean cube maps. Pad the
-        // array with an unused layer so it is always treated as a 2D array.
-        if n == 1 || n.is_multiple_of(6) { n + 1 } else { n }
-    }
-}
-
-fn build_tile(rgb: &image::RgbImage, w: u32, h: u32, l: &TileLayout, tx: u32, ty: u32) -> Vec<u8> {
-    let t = l.tile_size as usize;
-    let mut out = vec![255u8; t * t * 4];
-    let src = rgb.as_raw();
-    let x0 = (tx * l.tile_content) as i64 - GUTTER as i64;
-    let y0 = (ty * l.tile_content) as i64 - GUTTER as i64;
-    // Precompute wrapped source columns.
-    let cols: Vec<usize> = (0..t as i64).map(|i| (x0 + i).rem_euclid(w as i64) as usize).collect();
-    for j in 0..t {
-        let sy = (y0 + j as i64).clamp(0, h as i64 - 1) as usize;
-        let srow = &src[sy * w as usize * 3..(sy + 1) * w as usize * 3];
-        let drow = &mut out[j * t * 4..(j + 1) * t * 4];
-        for (i, &sx) in cols.iter().enumerate() {
-            drow[i * 4] = srow[sx * 3];
-            drow[i * 4 + 1] = srow[sx * 3 + 1];
-            drow[i * 4 + 2] = srow[sx * 3 + 2];
-        }
-    }
-    out
-}
-
-/// sRGB ↔ linear lookup tables for gamma-correct mip generation.
-struct Lut {
-    to_lin: [f32; 256],
-    to_srgb: Vec<u8>, // 4096 entries over [0,1]
-}
-
-impl Lut {
-    fn new() -> Self {
-        let mut to_lin = [0f32; 256];
-        for (i, v) in to_lin.iter_mut().enumerate() {
-            let c = i as f32 / 255.0;
-            *v = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
-        }
-        let to_srgb = (0..4096)
-            .map(|i| {
-                let l = i as f32 / 4095.0;
-                let s = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
-                (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
-            })
-            .collect();
-        Self { to_lin, to_srgb }
-    }
-    #[inline]
-    fn enc(&self, l: f32) -> u8 {
-        self.to_srgb[(l * 4095.0 + 0.5) as usize]
-    }
-}
-
-fn downsample_rgba(src: &[u8], size: u32, lut: &Lut) -> Vec<u8> {
-    let s = size as usize;
-    let d = s / 2;
-    let mut out = vec![255u8; d * d * 4];
-    for y in 0..d {
-        let r0 = &src[(2 * y) * s * 4..(2 * y + 1) * s * 4];
-        let r1 = &src[(2 * y + 1) * s * 4..(2 * y + 2) * s * 4];
-        let o = &mut out[y * d * 4..(y + 1) * d * 4];
-        for x in 0..d {
-            for c in 0..3 {
-                let a = lut.to_lin[r0[8 * x + c] as usize]
-                    + lut.to_lin[r0[8 * x + 4 + c] as usize]
-                    + lut.to_lin[r1[8 * x + c] as usize]
-                    + lut.to_lin[r1[8 * x + 4 + c] as usize];
-                o[4 * x + c] = lut.enc(a * 0.25);
-            }
-        }
-    }
-    out
-}
-
-/// 2× box downscale of an RGB image (used only when it does not fit on the GPU).
-fn halve(src: &image::RgbImage) -> image::RgbImage {
-    let (w, h) = (src.width(), src.height());
-    let (nw, nh) = (w.div_ceil(2), h.div_ceil(2));
-    let mut out = image::RgbImage::new(nw, nh);
-    let s = src.as_raw();
-    let o: &mut [u8] = &mut out;
-    for y in 0..nh as usize {
-        let y0 = (2 * y).min(h as usize - 1);
-        let y1 = (2 * y + 1).min(h as usize - 1);
-        for x in 0..nw as usize {
-            let x0 = (2 * x).min(w as usize - 1);
-            let x1 = (2 * x + 1).min(w as usize - 1);
-            for c in 0..3 {
-                let v = s[(y0 * w as usize + x0) * 3 + c] as u32
-                    + s[(y0 * w as usize + x1) * 3 + c] as u32
-                    + s[(y1 * w as usize + x0) * 3 + c] as u32
-                    + s[(y1 * w as usize + x1) * 3 + c] as u32;
-                o[(y * nw as usize + x) * 3 + c] = ((v + 2) / 4) as u8;
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -627,23 +367,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_alignment() {
-        for &(w, h) in &[(100, 50), (8000, 4000), (40000, 20000), (12345, 3000)] {
-            let l = TileLayout::new(w, h, 4096);
-            assert_eq!(l.tile_content % 32, 0);
-            assert!(l.tile_size <= 4096);
-            assert!(l.tiles_x * l.tile_content >= w && l.tiles_y * l.tile_content >= h);
-        }
+    fn par_chunks_passes_offsets() {
+        let mut data = vec![0u8; 10];
+        par_chunks(&mut data, 4, |c, off| c.iter_mut().enumerate().for_each(|(i, b)| *b = (off + i) as u8));
+        assert_eq!(data, (0..10).collect::<Vec<u8>>());
     }
 
     #[test]
-    fn tile_wraps_horizontally() {
-        let mut img = image::RgbImage::new(64, 32);
-        img.put_pixel(63, 0, image::Rgb([9, 8, 7]));
-        let l = TileLayout::new(64, 32, 4096);
-        let t = build_tile(&img, 64, 32, &l, 0, 0);
-        // Pixel just left of x=0 in the gutter is the image's last column.
-        let i = ((GUTTER as usize) * l.tile_size as usize + (GUTTER as usize - 1)) * 4;
-        assert_eq!(&t[i..i + 3], &[9, 8, 7]);
+    fn detects_jpeg_xl() {
+        assert!(is_jxl(&[0xFF, 0x0A, 1]));
+        assert!(!is_jxl(&[0xFF, 0xD8, 0xFF]));
     }
 }

@@ -13,6 +13,7 @@ mod loader;
 mod render;
 mod settings;
 mod source;
+mod tiles;
 mod view;
 #[cfg(target_arch = "wasm32")]
 mod web;

@@ -19,6 +19,7 @@ use crate::loader::{self, LoadJob, LoadedPano, Overrides};
 use crate::render::{PanoCallback, PanoRenderer, Uniforms};
 use crate::settings::{Interpolator, MonitorProfile, PanningMode, Settings};
 use crate::source::Source;
+use crate::tiles;
 use crate::view::{MAX_HFOV, PanoGeometry, UserLimits, View};
 use crate::xmp::{GPANO_TAGS, GPano};
 
@@ -120,6 +121,8 @@ pub struct RustyPanoApp {
     /// Files read asynchronously (browser file picker / drag and drop) that
     /// should be opened on the next frame.
     incoming: Arc<Mutex<Option<Source>>>,
+    /// Tiles for the current view are still being loaded.
+    tiles_streaming: bool,
 }
 
 /// Of several files opened together, the one to show: the first tour file,
@@ -170,6 +173,7 @@ impl RustyPanoApp {
             screenshot: std::env::var_os("RUSTYPANO_SCREENSHOT").map(|p| (PathBuf::from(p), 0)),
             viewport_px: (1280.0, 720.0),
             incoming: Arc::new(Mutex::new(None)),
+            tiles_streaming: false,
             settings,
         };
         if let Ok(i) = std::env::var("RUSTYPANO_INTERP") {
@@ -685,10 +689,15 @@ impl RustyPanoApp {
             ctx.set_cursor_icon(cursor);
         }
 
+        // Stream the tiles this view needs into the GPU cache.
+        self.tiles_streaming = pano.loaded.tiles.update(&pano.view, &self.queue);
+        if self.tiles_streaming {
+            ctx.request_repaint();
+        }
+
         // GPU draw.
         let v = &pano.view;
-        let g = &pano.loaded.gpu;
-        let scale = g.gpu_width as f64 / v.geo.width;
+        let g = &pano.loaded.tiles.gpu;
         let interp = if animating || response.dragged() || self.speed_test.is_some() {
             settings.interpolator_panning
         } else {
@@ -701,22 +710,22 @@ impl RustyPanoApp {
         } else {
             [srgb_to_linear(15), srgb_to_linear(15), srgb_to_linear(15), 1.0]
         };
-        let uniforms = Uniforms {
+        let mut uniforms = Uniforms {
             vp: [
                 (rect.min.x as f64 * ppp).round() as f32,
                 (rect.min.y as f64 * ppp).round() as f32,
                 v.vw as f32,
                 v.vh as f32,
             ],
-            img: [g.gpu_width as f32, g.gpu_height as f32, (v.geo.horizon_row * scale) as f32, v.focal() as f32],
+            img: [g.width as f32, g.height as f32, v.geo.horizon_row as f32, v.focal() as f32],
             cam: [
                 v.yaw.to_radians() as f32,
                 v.pitch.to_radians() as f32,
-                g.tile_content as f32,
-                loader::GUTTER as f32,
+                tiles::GUTTER as f32,
+                (g.grid.mip_levels() - 1) as f32,
             ],
-            tiles: [g.tile_size as f32, g.tiles_x as f32, g.tiles_y as f32, loader::MAX_LOD as f32],
-            flags: [interp.shader_id(), self.encode_srgb as u32, grid_flags, 1],
+            tile: [g.grid.cx as f32, g.grid.cy as f32, g.grid.sx as f32, g.grid.sy as f32],
+            flags: [interp.shader_id(), self.encode_srgb as u32, grid_flags, g.grid.base() as u32],
             grid: [gs.rows_distance.max(0.1), gs.columns_distance.max(0.1), gs.line_width, 0.0],
             grid_color: [
                 srgb_to_linear(gs.color[0]),
@@ -725,7 +734,9 @@ impl RustyPanoApp {
                 gs.color[3] as f32 / 255.0,
             ],
             bg,
+            ..Default::default()
         };
+        uniforms.set_levels(g);
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
             PanoCallback { uniforms, pano: Some(Arc::clone(g)) },
@@ -1002,11 +1013,7 @@ impl RustyPanoApp {
                 if let Some(p) = &self.pano {
                     let v = &p.view;
                     let l = &p.loaded;
-                    let mut size = format!("{}×{}", l.width, l.height);
-                    if l.downscale > 1 {
-                        size += &format!(" (GPU 1/{})", l.downscale);
-                    }
-                    ui.label(RichText::new(size).weak());
+                    ui.label(RichText::new(format!("{}×{}", l.width, l.height)).weak());
                     ui.separator();
                     ui.label(format!("{:.0}%", v.zoom_percent()));
                     ui.separator();
@@ -1069,13 +1076,21 @@ impl RustyPanoApp {
                     ui.add_space(6.0);
                     if let Some(p) = &self.pano {
                         let l = &p.loaded;
+                        let g = &l.tiles.gpu;
                         ui.label(tr!(
-                            "Current image: {w}×{h} px, {tiles} GPU tile(s) of {size} px, loaded in {secs} s",
+                            "Current image: {w}×{h} px in {levels} resolution levels, loaded in {secs} s",
                             w = l.width,
                             h = l.height,
-                            tiles = l.gpu.tiles_x * l.gpu.tiles_y,
-                            size = l.gpu.tile_size,
+                            levels = g.grid.levels.len(),
                             secs = format!("{:.2}", l.load_time)
+                        ));
+                        ui.label(tr!(
+                            "GPU tile cache: {used} of {slots} slots in use ({mb} MB), tiles of {tw}×{th} px",
+                            used = l.tiles.used_slots(),
+                            slots = g.slots,
+                            mb = (g.slots as u64 * g.grid.slot_bytes()) >> 20,
+                            tw = g.grid.cx,
+                            th = g.grid.cy
                         ));
                         if let Some(icc) = &l.icc_used {
                             ui.label(tr!("Colour management: {icc}", icc = icc));
@@ -1212,10 +1227,10 @@ impl RustyPanoApp {
                     }
                     _ => {
                         ui.horizontal(|ui| {
-                            ui.label(tr!("Maximum GPU memory per panorama"));
-                            ui.add(egui::DragValue::new(&mut draft.max_gpu_memory_mb).range(256..=65536).suffix(" MB").speed(16));
+                            ui.label(tr!("GPU tile cache"));
+                            ui.add(egui::DragValue::new(&mut draft.max_gpu_memory_mb).range(64..=4096).suffix(" MB").speed(16));
                         });
-                        ui.label(RichText::new(tr!("Larger panoramas are downscaled to fit.")).weak());
+                        ui.label(RichText::new(tr!("Only the visible part is kept on the GPU in full resolution; a bigger cache reloads less while panning.")).weak());
                         #[cfg(not(target_arch = "wasm32"))]
                         ui.checkbox(&mut draft.vsync, tr!("Vertical sync (needs restart)"));
                     }
@@ -1574,7 +1589,7 @@ impl RustyPanoApp {
         }
         let Some((path, frames)) = &mut self.screenshot else { return };
         *frames += 1;
-        let steady = self.last_motion.elapsed().as_secs_f32() > 0.4;
+        let steady = self.last_motion.elapsed().as_secs_f32() > 0.4 && !self.tiles_streaming;
         if ((*frames >= 20 && steady) || *frames == 150) && *frames < 1_000_000 {
             *frames = 1_000_000;
             let path = path.clone();

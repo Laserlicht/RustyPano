@@ -6,7 +6,7 @@ use std::sync::Arc;
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use eframe::wgpu;
 
-use crate::loader::GpuPano;
+use crate::tiles::{GpuTiles, MAX_LEVELS};
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -14,11 +14,21 @@ pub struct Uniforms {
     pub vp: [f32; 4],
     pub img: [f32; 4],
     pub cam: [f32; 4],
-    pub tiles: [f32; 4],
+    pub tile: [f32; 4],
     pub flags: [u32; 4],
     pub grid: [f32; 4],
     pub grid_color: [f32; 4],
     pub bg: [f32; 4],
+    /// Per pyramid level: (nx | ny << 16, first page-table row, width, height).
+    pub levels: [[u32; 4]; MAX_LEVELS],
+}
+
+impl Uniforms {
+    pub fn set_levels(&mut self, tiles: &GpuTiles) {
+        for (dst, l) in self.levels.iter_mut().zip(&tiles.grid.levels) {
+            *dst = [l.nx | (l.ny << 16), l.row, l.w, l.h];
+        }
+    }
 }
 
 pub struct PanoRenderer {
@@ -63,6 +73,16 @@ impl PanoRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
                     count: None,
                 },
             ],
@@ -130,7 +150,7 @@ impl PanoRenderer {
 
 pub struct PanoCallback {
     pub uniforms: Uniforms,
-    pub pano: Option<Arc<GpuPano>>,
+    pub pano: Option<Arc<GpuTiles>>,
 }
 
 impl CallbackTrait for PanoCallback {
@@ -152,6 +172,7 @@ impl CallbackTrait for PanoCallback {
                         wgpu::BindGroupEntry { binding: 0, resource: r.uniforms.as_entire_binding() },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&p.view) },
                         wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&r.samp_lin) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&p.table_view) },
                     ],
                 });
                 r.bind_group = Some((p.id, bg));

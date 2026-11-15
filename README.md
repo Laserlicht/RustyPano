@@ -109,21 +109,33 @@ with adjustable speed).
 
 ## How rendering works
 
-`src/loader.rs` decodes on a background thread, applies the ICC transform, then
-cuts the panorama into square tiles (≤ 4096 px) with a 32 px gutter of real
-neighbouring pixels (wrapping horizontally). Each tile becomes one layer of a
-`texture_2d_array`, with 6 gamma-correct mip levels built on the CPU. Because
-of the gutter, filtering never shows seams up to mip level 5, so panoramas far
-beyond the GPU's maximum texture size work.
+Panoramas are streamed in multiple resolutions, so GPU memory depends on the
+screen, not on the image size:
 
-`src/pano.wgsl` casts a ray per screen pixel, converts it to longitude/latitude,
-picks the tile and mip level from screen-space derivatives, and samples with
-the selected kernel. The grid overlay is drawn analytically in the same pass.
+- `src/loader.rs` decodes (on a background thread natively), applies the ICC
+  transform and builds a **resolution pyramid** on the CPU: full size, half,
+  quarter, … (gamma-correct 2× downscaling).
+- `src/tiles.rs` cuts every level into tiles. The tile width and height are
+  chosen per image (multiples of 32 between 512 and 1024 px) so the finest
+  levels divide almost evenly, e.g. 672×1024 for 20000×10000.
+- On the GPU there is only a **tile cache**: a `texture_2d_array` whose layers
+  ("slots") hold one tile each, with a 32 px gutter of real neighbouring pixels
+  and 6 gamma-correct mip levels, plus a small **page table** texture mapping
+  (level, tile) → slot. The coarsest level is always resident.
+- Every frame the visible tiles at the resolution the screen needs are worked
+  out on the CPU; missing ones are built by worker threads (in the browser:
+  within ~8 ms per frame) and the least recently used tiles are evicted.
+- `src/pano.wgsl` casts a ray per screen pixel, converts it to longitude/
+  latitude, picks the pyramid level from screen-space derivatives, looks the
+  tile up in the page table (falling back to coarser levels while finer tiles
+  stream in) and samples with the selected kernel. The grid overlay is drawn
+  analytically in the same pass.
 
-After uploading, the loader reads back a few texels to verify the upload.
-Some OpenGL drivers fail silently when video memory runs out; in that case the
-panorama is downscaled by 2 and uploaded again. There is also a configurable
-GPU memory budget (Settings → System).
+The cache size is set under Settings → System → GPU tile cache (default 768 MB,
+384 MB in the browser; a 4K screen needs well under 200 MB). Some OpenGL drivers
+fail silently when video memory runs out, so the cache is verified after
+allocation and made smaller if needed. The full image stays in main memory
+(about 4 bytes per pixel including the pyramid).
 
 ## Translations
 
@@ -148,7 +160,8 @@ catalog file.
 | `src/main.rs` | command line, window and wgpu device setup |
 | `src/app.rs` | UI, menus, toolbar, status bar, dialogs, input handling |
 | `src/view.rs` | view state, limits, projection maths (shared with picking) |
-| `src/loader.rs` | decode, colour management, tiling, mipmaps, upload |
+| `src/loader.rs` | read, decode, colour management, pyramid, cache setup |
+| `src/tiles.rs` | tile grid, pyramid, GPU tile cache, streaming, visibility |
 | `src/render.rs`, `src/pano.wgsl` | wgpu pipeline and shader |
 | `src/fsv.rs` | `.fsv` parser and GPano → view parameters |
 | `src/xmp.rs` | GPano XMP read (JPEG/TIFF/PNG) and write (JPEG) |

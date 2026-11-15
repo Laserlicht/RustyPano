@@ -90,7 +90,7 @@ pub struct Settings {
     pub show_toolbar: bool,
     pub show_status_bar: bool,
     pub vsync: bool,
-    /// Upper bound for GPU memory used by one panorama, in megabytes.
+    /// Size of the GPU tile cache for one panorama, in megabytes.
     pub max_gpu_memory_mb: u32,
     pub mru: Vec<PathBuf>,
 }
@@ -115,8 +115,9 @@ impl Default for Settings {
             show_toolbar: true,
             show_status_bar: true,
             vsync: true,
-            // Browsers give a page far less memory than a native process.
-            max_gpu_memory_mb: if cfg!(target_arch = "wasm32") { 1024 } else { 3072 },
+            // Size of the GPU tile cache. Only visible tiles need to fit; a
+            // bigger cache reloads less while panning. Browsers get less.
+            max_gpu_memory_mb: if cfg!(target_arch = "wasm32") { 384 } else { 768 },
             mru: Vec::new(),
         }
     }
