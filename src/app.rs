@@ -192,7 +192,7 @@ impl RustyPanoApp {
     fn open_dialog(&mut self, ctx: &egui::Context) {
         let mut d = rfd::FileDialog::new()
             .set_title("Choose a panorama")
-            .add_filter("Panoramas", &["jpg", "jpeg", "tif", "tiff", "png", "fsv"])
+            .add_filter("Panoramas", &[loader::IMAGE_EXTENSIONS, &["fsv"]].concat())
             .add_filter("Panorama tour files", &["fsv"])
             .add_filter("All files", &["*"]);
         if let Some(dir) = self.current_dir() {

@@ -96,11 +96,55 @@ pub fn start_load(
     LoadJob { path, progress, stage, cancel, rx, overrides }
 }
 
+/// Image file extensions the viewer opens (lower case).
+pub const IMAGE_EXTENSIONS: &[&str] =
+    &["jpg", "jpeg", "jpe", "tif", "tiff", "png", "webp", "bmp", "jxl"];
+
 pub fn is_supported(path: &Path) -> bool {
-    matches!(
-        path.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref(),
-        Some("jpg" | "jpeg" | "jpe" | "tif" | "tiff" | "png" | "fsv")
-    )
+    path.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .is_some_and(|e| e == "fsv" || IMAGE_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Container formats recognised from the first bytes of the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sniffed {
+    Jxl,
+    Other,
+}
+
+fn sniff(path: &Path) -> Sniffed {
+    let mut head = [0u8; 12];
+    let n = std::fs::File::open(path).and_then(|mut f| std::io::Read::read(&mut f, &mut head)).unwrap_or(0);
+    let head = &head[..n];
+    if head.starts_with(&[0xFF, 0x0A]) || head.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
+        Sniffed::Jxl
+    } else {
+        Sniffed::Other
+    }
+}
+
+/// Decode any supported image, returning the pixels and the embedded ICC profile.
+fn decode(path: &Path) -> Result<(image::DynamicImage, Option<Vec<u8>>), String> {
+    let err = |e: &dyn std::fmt::Display| format!("Cannot decode this image: {e}");
+    match sniff(path) {
+        Sniffed::Jxl => {
+            let f = std::io::BufReader::new(std::fs::File::open(path).map_err(|e| e.to_string())?);
+            let mut decoder = jxl_oxide::integration::JxlDecoder::new(f).map_err(|e| err(&e))?;
+            let icc = decoder.icc_profile().ok().flatten();
+            let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
+            Ok((img, icc))
+        }
+        Sniffed::Other => {
+            let mut reader = ImageReader::open(path).map_err(|e| e.to_string())?;
+            reader = reader.with_guessed_format().map_err(|e| e.to_string())?;
+            reader.no_limits();
+            let mut decoder = reader.into_decoder().map_err(|e| err(&e))?;
+            let icc = decoder.icc_profile().ok().flatten();
+            let img = image::DynamicImage::from_decoder(decoder).map_err(|e| err(&e))?;
+            Ok((img, icc))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,12 +178,7 @@ fn load(
     }
 
     set_stage("Decoding");
-    let mut reader = ImageReader::open(&image_path).map_err(|e| e.to_string())?;
-    reader = reader.with_guessed_format().map_err(|e| e.to_string())?;
-    reader.no_limits();
-    let mut decoder = reader.into_decoder().map_err(|e| format!("Cannot decode this image: {e}"))?;
-    let icc = decoder.icc_profile().ok().flatten();
-    let img = image::DynamicImage::from_decoder(decoder).map_err(|e| e.to_string())?;
+    let (img, icc) = decode(&image_path)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("cancelled".into());
     }

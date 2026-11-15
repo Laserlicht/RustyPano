@@ -88,8 +88,19 @@ fn read_xmp(path: &Path) -> Option<String> {
             Some(String::from_utf8_lossy(&v).into_owned())
         }
         "png" => read_png_xmp(path),
+        // WebP (RIFF "XMP " chunk) and JPEG XL ("xml " box) store the packet
+        // uncompressed in most files: scan for it.
+        "webp" | "jxl" => scan_xmp(path),
         _ => None,
     }
+}
+
+fn scan_xmp(path: &Path) -> Option<String> {
+    let data = std::fs::read(path).ok()?;
+    let start = data.windows(10).position(|w| w == b"<x:xmpmeta")?;
+    let end_tag = b"</x:xmpmeta>";
+    let len = data[start..].windows(end_tag.len()).position(|w| w == end_tag)? + end_tag.len();
+    Some(String::from_utf8_lossy(&data[start..start + len]).into_owned())
 }
 
 fn read_jpeg_xmp(path: &Path) -> Option<String> {

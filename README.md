@@ -9,7 +9,7 @@ metadata, partial panoramas, a grid overlay and colour management.
 
 ```sh
 cargo build --release
-./target/release/rustypano [options] [pano.jpg | pano.tif | pano.png | tour.fsv]
+./target/release/rustypano [options] [panorama image | tour.fsv]
 ```
 
 Options: `-y <yaw>`, `-p <pitch>`, `-hf <hfov>`, `-fs`
@@ -36,8 +36,10 @@ with adjustable speed).
 
 ## Features
 
-- JPEG, TIFF (8/16-bit) and PNG equirectangular panoramas, full or partial
-  (vertical extent from `HORIZONPOSITION` or GPano cropped-area tags).
+- Equirectangular panoramas in JPEG, TIFF (8/16-bit), PNG, WebP, BMP and
+  JPEG XL, full or partial (vertical extent from `HORIZONPOSITION` or GPano
+  cropped-area tags). Embedded ICC profiles are honoured; GPano XMP is read
+  from all formats except BMP and written into JPEG only.
 - `.fsv` files: `IMAGENAME`, `WINDOWTITLE`, `YAW`, `PITCH`, `HFOV`,
   `HORIZONPOSITION`, `MIN/MAXYAW`, `MIN/MAXPITCH`, `AUTOSPIN`, and
   `BEGIN HOTSPOT … END HOTSPOT` blocks (`X`, `Y` in percent, `DESCRIPTION`,

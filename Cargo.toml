@@ -9,7 +9,8 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 dirs = "7.0.0"
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 env_logger = "0.11.11"
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "tiff", "png"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "tiff", "png", "webp", "bmp"] }
+jxl-oxide = { version = "0.12.6", features = ["image"] }
 log = "0.4.35"
 qcms = "0.3.0"
 rfd = "0.18.0"
