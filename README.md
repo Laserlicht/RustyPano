@@ -47,6 +47,9 @@ packaging/web/build-web.sh
 python3 -m http.server -d dist/web 8080   # then open http://localhost:8080
 ```
 
+Every push to `main` also deploys the web version to the repository's GitHub
+Pages site (enable it once under Settings → Pages → Source: *GitHub Actions*).
+
 The page shows the app icon while the WebAssembly module loads, then the viewer
 fills the whole browser window. Rendering uses WebGPU where the browser offers it
 and falls back to WebGL2. Fullscreen uses the browser's Fullscreen API (`F11` key
