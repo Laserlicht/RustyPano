@@ -138,6 +138,11 @@ GPU nor main memory has to hold the whole image:
   width and height are chosen per image (multiples of 32 between 512 and
   1024 px) so the finest levels divide almost evenly; every tile carries a
   32 px gutter of real neighbouring pixels (wrapping horizontally).
+- **Parallel work:** natively the image is decoded on its own thread, rows are
+  up-sampled and halved and tiles cut on all cores, and tiles are encoded by a
+  pool of threads while the next stripes are read (with a bounded queue, so a
+  slow encoder slows reading down instead of filling memory). With
+  `RUST_LOG=info` the time of each step is logged.
 - **Tile cache** (`src/store.rs`): tiles are stored as JPEG (quality 92, 4:4:4)
   on disk or in the browser's Cache Storage, keyed by the file's identity and
   the colour settings, in a directory (or set of caches) belonging to the

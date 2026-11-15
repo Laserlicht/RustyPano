@@ -179,35 +179,38 @@ impl TileGrid {
 // Tile pixels
 
 /// sRGB ↔ linear lookup tables for gamma-correct downsampling.
+/// Integer only: linear light with 14 bits per sample, so the sum of four
+/// samples indexes the sRGB table directly.
 pub struct Lut {
-    to_lin: [f32; 256],
-    to_srgb: Vec<u8>, // 4096 entries over [0,1]
+    to_lin: [u16; 256],
+    /// sRGB value for every possible sum of four linear samples.
+    sum_to_srgb: Vec<u8>,
 }
+
+const LIN_MAX: u32 = (1 << 14) - 1;
 
 impl Lut {
     pub fn new() -> Self {
-        let mut to_lin = [0f32; 256];
+        let mut to_lin = [0u16; 256];
         for (i, v) in to_lin.iter_mut().enumerate() {
-            let c = i as f32 / 255.0;
-            *v = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            let c = i as f64 / 255.0;
+            let l = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+            *v = (l * LIN_MAX as f64).round() as u16;
         }
-        let to_srgb = (0..4096)
-            .map(|i| {
-                let l = i as f32 / 4095.0;
+        let sum_to_srgb = (0..=4 * LIN_MAX)
+            .map(|sum| {
+                let l = sum as f64 / (4 * LIN_MAX) as f64;
                 let s = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 };
-                (s * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+                (s * 255.0).round().clamp(0.0, 255.0) as u8
             })
             .collect();
-        Self { to_lin, to_srgb }
+        Self { to_lin, sum_to_srgb }
     }
-    #[inline]
-    fn enc(&self, l: f32) -> u8 {
-        self.to_srgb[(l * 4095.0 + 0.5) as usize]
-    }
-    #[inline]
+    #[inline(always)]
     pub(crate) fn avg4(&self, a: u8, b: u8, c: u8, d: u8) -> u8 {
         let t = &self.to_lin;
-        self.enc((t[a as usize] + t[b as usize] + t[c as usize] + t[d as usize]) * 0.25)
+        let sum = t[a as usize] as usize + t[b as usize] as usize + t[c as usize] as usize + t[d as usize] as usize;
+        self.sum_to_srgb[sum]
     }
 }
 

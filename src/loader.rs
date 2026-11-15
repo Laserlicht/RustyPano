@@ -136,6 +136,27 @@ pub(crate) fn par_chunks(data: &mut [u8], chunk: usize, f: impl Fn(&mut [u8], us
     }
 }
 
+/// Run `f(index, item)` for every item, in parallel where threads are
+/// available (at least `min_per_thread` items per thread, so small batches do
+/// not pay for starting threads).
+pub(crate) fn par_each<T: Send>(items: &mut [T], min_per_thread: usize, f: impl Fn(usize, &mut T) + Sync) {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let per = items.len().div_ceil(threads()).max(min_per_thread).max(1);
+        std::thread::scope(|s| {
+            for (ci, chunk) in items.chunks_mut(per).enumerate() {
+                let f = &f;
+                s.spawn(move || chunk.iter_mut().enumerate().for_each(|(i, t)| f(ci * per + i, t)));
+            }
+        });
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = min_per_thread;
+        items.iter_mut().enumerate().for_each(|(i, t)| f(i, t));
+    }
+}
+
 pub(crate) fn threads() -> usize {
     #[cfg(not(target_arch = "wasm32"))]
     return std::thread::available_parallelism().map_or(4, |n| n.get());
@@ -360,6 +381,7 @@ async fn build_tiles(
     let (open, gpano) = open_input(src).await?;
     set_stage(tr!("Building tiles"));
     yield_now().await;
+    #[cfg_attr(not(target_arch = "wasm32"), allow(unused_mut))] // read in place in the browser
     let mut decoded = open_rows(open)?;
     let (w, h) = (decoded.width, decoded.height);
     let (xf, icc_used) = colour_transform(decoded.icc.as_deref(), settings);
@@ -376,16 +398,27 @@ async fn build_tiles(
     // About 8 MB of rows per step.
     let batch = ((8 << 20) / (w as usize * 3)).clamp(8, 512);
     let mut rows = Vec::with_capacity(batch * w as usize * 3);
+    // Natively, decode on a thread of its own so decoding overlaps with
+    // building the pyramid.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut decoded = Prefetch::start(decoded, batch);
     let mut done = 0usize;
     let mut bytes = 0u64;
     // Time spent per step, logged at the end.
     let (mut t_read, mut t_build, mut t_store) = (0f64, 0f64, 0f64);
+    // Natively, tiles are encoded by a pool of threads while the next stripes
+    // are being decoded.
+    #[cfg(not(target_arch = "wasm32"))]
+    let pool = EncoderPool::new(building.store.clone(), grid.sx, grid.sy);
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
         rows.clear();
         let t = Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
+        let n = decoded.read(&mut rows)?;
+        #[cfg(target_arch = "wasm32")]
         let n = decoded.rows.read(batch, &mut rows)?;
         t_read += t.elapsed().as_secs_f64();
         if n == 0 {
@@ -401,7 +434,12 @@ async fn build_tiles(
         t_build += t.elapsed().as_secs_f64();
         if !tiles.is_empty() {
             let t = Instant::now();
-            bytes += store_tiles(&building.store, tiles, &grid, cancel).await?;
+            #[cfg(not(target_arch = "wasm32"))]
+            pool.submit(tiles)?;
+            #[cfg(target_arch = "wasm32")]
+            {
+                bytes += store_tiles(&building.store, tiles, &grid, cancel).await?;
+            }
             t_store += t.elapsed().as_secs_f64();
         }
         done += n;
@@ -410,7 +448,19 @@ async fn build_tiles(
         yield_now().await;
     }
     drop(decoded);
-    log::info!("Tiles built: decoding {t_read:.2} s, pyramid {t_build:.2} s, encoding and storing {t_store:.2} s");
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let t = Instant::now();
+        bytes += pool.finish()?;
+        t_store += t.elapsed().as_secs_f64();
+    }
+    log::info!(
+        "Tiles built: decoding {t_read:.2} s, pyramid {t_build:.2} s (cutting tiles {:.2} s, halving {:.2} s), \
+         waiting for encoding {t_store:.2} s, {} MB",
+        builder.time_tiles,
+        builder.time_halve,
+        bytes >> 20
+    );
     if !builder.is_complete() {
         return Err(tr!("Cannot decode this image: {error}", error = "image data ended early"));
     }
@@ -419,49 +469,180 @@ async fn build_tiles(
     Ok((store, meta))
 }
 
-/// Encode tiles as JPEG and store them; returns the bytes written.
-async fn store_tiles(store: &TileStore, tiles: Vec<(TileId, Vec<u8>)>, grid: &TileGrid, cancel: &AtomicBool) -> Result<u64, String> {
-    let (w, h) = (grid.sx, grid.sy);
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let next = AtomicU32::new(0);
-        let bytes = std::sync::atomic::AtomicU64::new(0);
-        let error = Mutex::new(None);
-        std::thread::scope(|s| {
-            for _ in 0..threads().min(tiles.len()) {
-                s.spawn(|| {
-                    while !cancel.load(Ordering::Relaxed) {
-                        let i = next.fetch_add(1, Ordering::Relaxed) as usize;
-                        let Some((t, rgb)) = tiles.get(i) else { return };
-                        let r = store::encode_tile(rgb, w, h).and_then(|jpeg| {
-                            bytes.fetch_add(jpeg.len() as u64, Ordering::Relaxed);
-                            store.put_blocking(*t, jpeg)
-                        });
-                        if let Err(e) = r {
-                            *error.lock().unwrap() = Some(e);
+/// Reads row batches on a background thread, a couple of batches ahead.
+#[cfg(not(target_arch = "wasm32"))]
+struct Prefetch {
+    rx: mpsc::Receiver<Result<Vec<u8>, String>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    /// Bytes per row, to count rows in a batch.
+    row: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Prefetch {
+    fn start(mut decoded: crate::pyramid::Decoded, batch: usize) -> Self {
+        let (tx, rx) = mpsc::sync_channel(2);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let width = decoded.width;
+        let worker = std::thread::Builder::new()
+            .name("image-decoder".into())
+            .spawn(move || {
+                while !stop2.load(Ordering::Relaxed) {
+                    let mut buf = Vec::new();
+                    match decoded.rows.read(batch, &mut buf) {
+                        Ok(0) => return,
+                        Ok(_) => {
+                            if tx.send(Ok(buf)).is_err() {
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
                             return;
                         }
                     }
-                });
+                }
+            })
+            .expect("spawn image decoder");
+        Self { rx, worker: Some(worker), stop, row: width as usize * 3 }
+    }
+
+    /// Next batch of rows (appended to `out`); 0 at the end.
+    fn read(&mut self, out: &mut Vec<u8>) -> Result<usize, String> {
+        match self.rx.recv() {
+            Ok(Ok(buf)) => {
+                let n = buf.len() / self.row;
+                if out.is_empty() {
+                    *out = buf;
+                } else {
+                    out.extend_from_slice(&buf);
+                }
+                Ok(n)
             }
-        });
-        if let Some(e) = error.into_inner().unwrap() {
-            return Err(e);
+            Ok(Err(e)) => Err(e),
+            Err(_) => Ok(0),
         }
-        Ok(bytes.into_inner())
     }
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = cancel;
-        let mut bytes = 0;
-        for (t, rgb) in tiles {
-            let jpeg = store::encode_tile(&rgb, w, h)?;
-            bytes += jpeg.len() as u64;
-            store.put(t, jpeg).await?;
-            yield_now().await;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Unblock a pending send, then wait for the thread.
+        while self.rx.try_recv().is_ok() {}
+        if let Some(w) = self.worker.take() {
+            while !w.is_finished() {
+                while self.rx.try_recv().is_ok() {}
+                std::thread::yield_now();
+            }
+            let _ = w.join();
         }
-        Ok(bytes)
     }
+}
+
+/// Encodes and stores tiles on background threads while the loader keeps
+/// decoding. The queue is bounded, so a slow encoder slows down decoding
+/// instead of piling up tiles in memory.
+#[cfg(not(target_arch = "wasm32"))]
+struct EncoderPool {
+    tx: Option<mpsc::SyncSender<(TileId, Vec<u8>)>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    bytes: Arc<std::sync::atomic::AtomicU64>,
+    error: Arc<Mutex<Option<String>>>,
+    stop: Arc<AtomicBool>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl EncoderPool {
+    fn new(store: TileStore, w: u32, h: u32) -> Self {
+        let n = threads().clamp(1, 32);
+        let (tx, rx) = mpsc::sync_channel::<(TileId, Vec<u8>)>(2 * n);
+        let rx = Arc::new(Mutex::new(rx));
+        let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let error = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let workers = (0..n)
+            .map(|i| {
+                let (rx, store, bytes, error, stop) = (rx.clone(), store.clone(), bytes.clone(), error.clone(), stop.clone());
+                std::thread::Builder::new()
+                    .name(format!("tile-encoder-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let Ok((t, rgb)) = rx.lock().unwrap().recv() else { return };
+                            if stop.load(Ordering::Relaxed) {
+                                continue;
+                            }
+                            let r = store::encode_tile(&rgb, w, h).and_then(|jpeg| {
+                                bytes.fetch_add(jpeg.len() as u64, Ordering::Relaxed);
+                                store.put_blocking(t, jpeg)
+                            });
+                            if let Err(e) = r {
+                                error.lock().unwrap().get_or_insert(e);
+                                stop.store(true, Ordering::Relaxed);
+                            }
+                        }
+                    })
+                    .expect("spawn tile encoder")
+            })
+            .collect();
+        Self { tx: Some(tx), workers, bytes, error, stop }
+    }
+
+    fn submit(&self, tiles: Vec<(TileId, Vec<u8>)>) -> Result<(), String> {
+        for tile in tiles {
+            if let Some(e) = self.error.lock().unwrap().clone() {
+                return Err(e);
+            }
+            if let Some(tx) = &self.tx {
+                tx.send(tile).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Wait for all queued tiles; returns the bytes written.
+    fn finish(mut self) -> Result<u64, String> {
+        self.tx = None;
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+        match self.error.lock().unwrap().take() {
+            Some(e) => Err(e),
+            None => Ok(self.bytes.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for EncoderPool {
+    /// On cancel or error: drop the queued tiles and let the threads end.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.tx = None;
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
+}
+
+/// Encode tiles as JPEG and store them one after the other (browser).
+#[cfg(target_arch = "wasm32")]
+async fn store_tiles(store: &TileStore, tiles: Vec<(TileId, Vec<u8>)>, grid: &TileGrid, cancel: &AtomicBool) -> Result<u64, String> {
+    let (w, h) = (grid.sx, grid.sy);
+    let mut bytes = 0;
+    for (t, rgb) in tiles {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let jpeg = store::encode_tile(&rgb, w, h)?;
+        bytes += jpeg.len() as u64;
+        store.put(t, jpeg).await?;
+        yield_now().await;
+    }
+    Ok(bytes)
 }
 
 /// The browser cannot wait for a GPU readback; WebGPU reports allocation

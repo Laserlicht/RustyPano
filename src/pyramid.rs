@@ -22,13 +22,13 @@ use image::{ImageDecoder, ImageDecoderRect, ImageReader};
 
 use crate::tiles::{GUTTER, Lut, TileGrid, TileId};
 
-pub trait ReadSeek: Read + Seek {}
-impl<T: Read + Seek> ReadSeek for T {}
+pub trait ReadSeek: Read + Seek + Send {}
+impl<T: Read + Seek + Send> ReadSeek for T {}
 
 pub type Input = BufReader<Box<dyn ReadSeek>>;
 
 /// Hands out RGB8 rows from top to bottom.
-pub trait RowReader {
+pub trait RowReader: Send {
     /// Append up to `max` rows to `out`; returns how many (0 at the end).
     fn read(&mut self, max: usize, out: &mut Vec<u8>) -> Result<usize, String>;
 }
@@ -224,7 +224,7 @@ struct RectRows<D: ImageDecoderRect> {
     ct: image::ColorType,
 }
 
-impl<D: ImageDecoderRect> RowReader for RectRows<D> {
+impl<D: ImageDecoderRect + Send> RowReader for RectRows<D> {
     fn read(&mut self, max: usize, out: &mut Vec<u8>) -> Result<usize, String> {
         let n = (max as u32).min(self.height - self.y);
         if n == 0 {
@@ -341,74 +341,105 @@ impl JpegRows {
         Ok(())
     }
 
-    /// Component rows needed for output row `y`: the nearest sample row and,
-    /// for vertically up-sampled components, its neighbour on that side.
-    fn needed(&self, c: usize, y: usize) -> (usize, usize) {
-        let h = self.planes[c].height;
-        if self.fy[c] == 1 {
-            return (y.min(h - 1), y.min(h - 1));
-        }
-        let near = (y / 2).min(h - 1);
-        let far = if y.is_multiple_of(2) { near.saturating_sub(1) } else { (near + 1).min(h - 1) };
-        (near, far)
+    fn ready(&self, y: usize) -> bool {
+        (0..self.planes.len()).all(|c| {
+            let (a, b) = needed_rows(self.planes[c].height, self.fy[c], y);
+            self.received[c] > a.max(b)
+        })
     }
 
-    /// One component, up-sampled to the full image width (same "fancy"
-    /// triangle filter as zune-jpeg: vertical first, then horizontal).
-    fn component_row(&self, c: usize, y: usize) -> Vec<u8> {
-        let (near, far) = self.needed(c, y);
-        let row = |i: usize| &self.rows[c][i - self.first[c]];
-        let src: Vec<u8> = if self.fy[c] == 1 {
-            row(near).to_vec()
-        } else {
-            let (a, b) = (row(near), row(far));
-            a.iter().zip(b).map(|(&n, &f)| ((3 * n as u16 + f as u16 + 2) >> 2) as u8).collect()
+    /// Forget component rows no later output row needs.
+    fn drop_rows(&mut self) {
+        if self.next_out >= self.height {
+            return;
+        }
+        for c in 0..self.planes.len() {
+            let (a, b) = needed_rows(self.planes[c].height, self.fy[c], self.next_out);
+            while self.first[c] < a.min(b) {
+                self.rows[c].pop_front();
+                self.first[c] += 1;
+            }
+        }
+    }
+}
+
+/// Component rows needed for output row `y`: the nearest sample row and, for
+/// vertically up-sampled components, its neighbour on that side.
+fn needed_rows(h: usize, fy: usize, y: usize) -> (usize, usize) {
+    if fy == 1 {
+        return (y.min(h - 1), y.min(h - 1));
+    }
+    let near = (y / 2).min(h - 1);
+    let far = if y.is_multiple_of(2) { near.saturating_sub(1) } else { (near + 1).min(h - 1) };
+    (near, far)
+}
+
+/// Read-only view of the decoded component rows, so that output rows can be
+/// converted in parallel.
+struct RowsView<'a> {
+    rows: &'a [VecDeque<Vec<u8>>],
+    first: &'a [usize],
+    heights: Vec<usize>,
+    fx: &'a [usize],
+    fy: &'a [usize],
+    width: usize,
+    colour: JpegColour,
+}
+
+impl RowsView<'_> {
+    /// Rows (nearest, neighbour) of component `c` for output row `y`.
+    fn src(&self, c: usize, y: usize) -> (&[u8], &[u8]) {
+        let (near, far) = needed_rows(self.heights[c], self.fy[c], y);
+        let r = &self.rows[c];
+        (&r[near - self.first[c]], &r[far - self.first[c]])
+    }
+
+    /// Up-sampled sample `x` of a component: zune-jpeg's "fancy" triangle
+    /// filter, vertical (rounded) first, then horizontal.
+    #[inline(always)]
+    fn sample(near: &[u8], far: &[u8], vert: bool, horiz: bool, x: usize) -> u8 {
+        let v = |i: usize| -> u16 {
+            if vert { (3 * near[i] as u16 + far[i] as u16 + 2) >> 2 } else { near[i] as u16 }
         };
-        if self.fx[c] == 1 {
-            return src;
+        if !horiz {
+            return v(x) as u8;
         }
-        let n = src.len();
-        let mut out = vec![0u8; self.width];
-        for (x, o) in out.iter_mut().enumerate() {
-            let i = (x / 2).min(n - 1);
-            let j = if x % 2 == 0 { i.saturating_sub(1) } else { (i + 1).min(n - 1) };
-            *o = ((3 * src[i] as u16 + src[j] as u16 + 2) >> 2) as u8;
-        }
-        out
+        let n = near.len();
+        let i = (x / 2).min(n - 1);
+        let j = if x.is_multiple_of(2) { i.saturating_sub(1) } else { (i + 1).min(n - 1) };
+        ((3 * v(i) + v(j) + 2) >> 2) as u8
     }
 
-    fn emit(&mut self, out: &mut Vec<u8>) {
-        let y = self.next_out;
-        let comps: Vec<Vec<u8>> = (0..self.planes.len()).map(|c| self.component_row(c, y)).collect();
+    fn convert_row(&self, y: usize, dst: &mut [u8]) {
+        let comp = |c: usize| {
+            let (n, f) = self.src(c, y);
+            (n, f, self.fy[c] == 2, self.fx[c] == 2)
+        };
         match self.colour {
-            JpegColour::Gray => comps[0][..self.width].iter().for_each(|&g| out.extend_from_slice(&[g, g, g])),
-            JpegColour::Rgb => {
-                for x in 0..self.width {
-                    out.extend_from_slice(&[comps[0][x], comps[1][x], comps[2][x]]);
+            JpegColour::Gray => {
+                let (n, f, v, h) = comp(0);
+                for (x, d) in dst.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                    let g = Self::sample(n, f, v, h, x);
+                    d.copy_from_slice(&[g, g, g]);
                 }
             }
-            JpegColour::YCbCr => {
+            JpegColour::Rgb | JpegColour::YCbCr => {
+                let (c0, c1, c2) = (comp(0), comp(1), comp(2));
+                let ycc = self.colour == JpegColour::YCbCr;
                 let clamp = |v: i32| v.clamp(0, 255) as u8;
-                for x in 0..self.width {
-                    let y0 = comps[0][x] as i32 * Y_CF + YUV_RND;
-                    let (cb, cr) = (comps[1][x] as i32 - 128, comps[2][x] as i32 - 128);
-                    out.extend_from_slice(&[
-                        clamp((y0 + cr * CR_CF) >> 14),
-                        clamp((y0 + cr * G_CR + cb * G_CB) >> 14),
-                        clamp((y0 + cb * CB_CF) >> 14),
-                    ]);
-                }
-            }
-        }
-        self.next_out += 1;
-        // Forget rows no later output row needs.
-        if self.next_out < self.height {
-            for c in 0..self.planes.len() {
-                let (a, b) = self.needed(c, self.next_out);
-                let keep = a.min(b);
-                while self.first[c] < keep {
-                    self.rows[c].pop_front();
-                    self.first[c] += 1;
+                for (x, d) in dst.as_chunks_mut::<3>().0.iter_mut().enumerate().take(self.width) {
+                    let a = Self::sample(c0.0, c0.1, c0.2, c0.3, x);
+                    let b = Self::sample(c1.0, c1.1, c1.2, c1.3, x);
+                    let c = Self::sample(c2.0, c2.1, c2.2, c2.3, x);
+                    if ycc {
+                        let y0 = a as i32 * Y_CF + YUV_RND;
+                        let (cb, cr) = (b as i32 - 128, c as i32 - 128);
+                        d[0] = clamp((y0 + cr * CR_CF) >> 14);
+                        d[1] = clamp((y0 + cr * G_CR + cb * G_CB) >> 14);
+                        d[2] = clamp((y0 + cb * CB_CF) >> 14);
+                    } else {
+                        d.copy_from_slice(&[a, b, c]);
+                    }
                 }
             }
         }
@@ -417,23 +448,46 @@ impl JpegRows {
 
 impl RowReader for JpegRows {
     fn read(&mut self, max: usize, out: &mut Vec<u8>) -> Result<usize, String> {
-        let mut n = 0;
-        while n < max && self.next_out < self.height {
-            let y = self.next_out;
-            let ready = (0..self.planes.len()).all(|c| {
-                let (a, b) = self.needed(c, y);
-                self.received[c] > a.max(b)
-            });
-            if ready {
-                self.emit(out);
-                n += 1;
-            } else if self.complete {
-                return Err(err("JPEG data ended early"));
-            } else {
-                self.pull()?;
-            }
+        let start = self.next_out;
+        let mut end = (start + max).min(self.height);
+        if start >= end {
+            return Ok(0);
         }
-        Ok(n)
+        // Decode iMCU rows until the whole block of output rows is ready.
+        while !self.ready(end - 1) {
+            if self.complete {
+                while end > start && !self.ready(end - 1) {
+                    end -= 1;
+                }
+                if end == start {
+                    return Err(err("JPEG data ended early"));
+                }
+                break;
+            }
+            self.pull()?;
+        }
+        // Up-sample and convert the block, in parallel where possible.
+        let row = self.width * 3;
+        let base = out.len();
+        out.resize(base + (end - start) * row, 0);
+        let view = RowsView {
+            rows: &self.rows,
+            first: &self.first,
+            heights: self.planes.iter().map(|p| p.height).collect(),
+            fx: &self.fx,
+            fy: &self.fy,
+            width: self.width,
+            colour: self.colour,
+        };
+        let per = (end - start).div_ceil(crate::loader::threads()).max(1) * row;
+        crate::loader::par_chunks(&mut out[base..], per, |chunk, off| {
+            for (i, dst) in chunk.chunks_exact_mut(row).enumerate() {
+                view.convert_row(start + off / row + i, dst);
+            }
+        });
+        self.next_out = end;
+        self.drop_rows();
+        Ok(end - start)
     }
 }
 
@@ -648,6 +702,9 @@ pub struct PyramidBuilder {
     grid: TileGrid,
     bands: Vec<Band>,
     tiles: Vec<(TileId, Vec<u8>)>,
+    /// Seconds spent cutting tiles and halving rows (for the load log).
+    pub time_tiles: f64,
+    pub time_halve: f64,
 }
 
 impl PyramidBuilder {
@@ -657,15 +714,14 @@ impl PyramidBuilder {
             .iter()
             .map(|l| Band { w: l.w as usize, h: l.h as usize, rows: VecDeque::new(), first: 0, received: 0, next_tile_row: 0 })
             .collect();
-        Self { grid, bands, tiles: Vec::new() }
+        Self { grid, bands, tiles: Vec::new(), time_tiles: 0.0, time_halve: 0.0 }
     }
 
     /// Feed full-resolution RGB8 rows (any number, top to bottom).
     pub fn push_rows(&mut self, data: &[u8], lut: &Lut) {
         let row_len = self.bands[0].w * 3;
-        for row in data.chunks_exact(row_len) {
-            self.push(0, row.to_vec(), lut);
-        }
+        let rows: Vec<Vec<u8>> = data.chunks_exact(row_len).map(<[u8]>::to_vec).collect();
+        self.push_batch(0, rows, lut);
     }
 
     /// Tiles finished since the last call: RGB8, `sx × sy` pixels incl. gutter.
@@ -678,26 +734,39 @@ impl PyramidBuilder {
         self.bands.iter().all(|b| b.received == b.h)
     }
 
-    fn push(&mut self, k: usize, row: Vec<u8>, lut: &Lut) {
+    /// Add rows to level `k`, emit finished tiles, and pass the rows halved
+    /// to the next level.
+    fn push_batch(&mut self, k: usize, rows: Vec<Vec<u8>>, lut: &Lut) {
+        if rows.is_empty() {
+            return;
+        }
+        let start = self.bands[k].received;
         {
             let b = &mut self.bands[k];
-            debug_assert_eq!(row.len(), b.w * 3);
-            b.rows.push_back(row);
-            b.received += 1;
+            debug_assert!(rows.iter().all(|r| r.len() == b.w * 3));
+            b.received += rows.len();
+            b.rows.extend(rows);
         }
+        let t = web_time::Instant::now();
         self.emit_ready(k);
+        self.time_tiles += t.elapsed().as_secs_f64();
 
-        let (y, h) = (self.bands[k].received - 1, self.bands[k].h);
         if k + 1 < self.bands.len() {
-            // Halve pairs of rows into the next level; an odd last row is
-            // paired with itself.
-            if y % 2 == 1 || y == h - 1 {
-                let b = &self.bands[k];
-                let a = b.row(y - y % 2);
-                let c = b.row(y);
-                let half = halve_rows(a, c, b.w, lut);
-                self.push(k + 1, half, lut);
-            }
+            // Row pairs completed by this batch (an odd last row is paired
+            // with itself); the first row of a pair may be from the previous
+            // batch, which is why the latest row is always kept.
+            let b = &self.bands[k];
+            let pairs: Vec<(usize, usize)> =
+                (start..b.received).filter(|&y| y % 2 == 1 || y == b.h - 1).map(|y| (y - y % 2, y)).collect();
+            let t = web_time::Instant::now();
+            let nw = b.w.div_ceil(2);
+            let mut halved: Vec<Vec<u8>> = vec![vec![0u8; nw * 3]; pairs.len()];
+            crate::loader::par_each(&mut halved, 16, |i, dst| {
+                let (a, c) = pairs[i];
+                halve_rows_into(b.row(a), b.row(c), b.w, lut, dst);
+            });
+            self.time_halve += t.elapsed().as_secs_f64();
+            self.push_batch(k + 1, halved, lut);
         }
         self.drop_unneeded(k);
     }
@@ -717,20 +786,25 @@ impl PyramidBuilder {
             if b.received <= last_needed {
                 return;
             }
-            for tx in 0..level.nx as usize {
-                let mut rgb = vec![0u8; sx * sy * 3];
-                let x0 = (tx * cx) as i64 - g as i64;
-                for j in 0..sy {
-                    let sy_ = ((r * cy) as i64 - g as i64 + j as i64).clamp(0, b.h as i64 - 1) as usize;
-                    let src = b.row(sy_);
-                    let dst = &mut rgb[j * sx * 3..(j + 1) * sx * 3];
-                    for i in 0..sx {
-                        let x = (x0 + i as i64).rem_euclid(b.w as i64) as usize;
-                        dst[i * 3..i * 3 + 3].copy_from_slice(&src[x * 3..x * 3 + 3]);
+            let mut tiles: Vec<Vec<u8>> = vec![vec![0u8; sx * sy * 3]; level.nx as usize];
+            crate::loader::par_each(&mut tiles, 1, |tx, rgb| {
+                let x0 = ((tx * cx) as i64 - g as i64).rem_euclid(b.w as i64) as usize;
+                for (j, dst) in rgb.chunks_exact_mut(sx * 3).enumerate() {
+                    let y = ((r * cy) as i64 - g as i64 + j as i64).clamp(0, b.h as i64 - 1) as usize;
+                    let src = b.row(y);
+                    // Copy whole runs of pixels, wrapping around at the seam.
+                    let (mut x, mut filled) = (x0, 0);
+                    while filled < sx {
+                        let n = (sx - filled).min(b.w - x);
+                        dst[filled * 3..(filled + n) * 3].copy_from_slice(&src[x * 3..(x + n) * 3]);
+                        filled += n;
+                        x = 0;
                     }
                 }
-                self.tiles.push((TileId { level: k as u8, tx: tx as u16, ty: r as u16 }, rgb));
-            }
+            });
+            self.tiles.extend(
+                tiles.into_iter().enumerate().map(|(tx, rgb)| (TileId { level: k as u8, tx: tx as u16, ty: r as u16 }, rgb)),
+            );
             self.bands[k].next_tile_row += 1;
         }
     }
@@ -751,16 +825,13 @@ impl PyramidBuilder {
 }
 
 /// Gamma-correct 2×2 average of two rows (odd widths round up).
-fn halve_rows(a: &[u8], b: &[u8], w: usize, lut: &Lut) -> Vec<u8> {
-    let nw = w.div_ceil(2);
-    let mut out = vec![0u8; nw * 3];
-    for x in 0..nw {
+fn halve_rows_into(a: &[u8], b: &[u8], w: usize, lut: &Lut, out: &mut [u8]) {
+    for (x, o) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
         let (p, q) = (2 * x, (2 * x + 1).min(w - 1));
         for c in 0..3 {
-            out[x * 3 + c] = lut.avg4(a[p * 3 + c], a[q * 3 + c], b[p * 3 + c], b[q * 3 + c]);
+            o[c] = lut.avg4(a[p * 3 + c], a[q * 3 + c], b[p * 3 + c], b[q * 3 + c]);
         }
     }
-    out
 }
 
 #[cfg(test)]

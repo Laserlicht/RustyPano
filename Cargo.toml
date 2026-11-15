@@ -8,7 +8,7 @@ license = "MIT"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "tiff", "png", "webp", "bmp"] }
-jpeg-encoder = "0.7.1"
+jpeg-encoder = { version = "0.7.1", features = ["simd"] }
 log = "0.4.35"
 png = "0.18.1"
 qcms = "0.3.0"

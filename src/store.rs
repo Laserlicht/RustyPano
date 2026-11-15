@@ -81,6 +81,7 @@ pub fn hash_bytes(data: &[u8]) -> u64 {
     h
 }
 
+#[derive(Clone)]
 pub enum TileStore {
     #[cfg(not(target_arch = "wasm32"))]
     Disk(PathBuf),
@@ -512,6 +513,42 @@ mod tests {
         assert!(jpeg.len() < rgb.len());
         let back = decode_tile(&jpeg).unwrap();
         assert_eq!(back.len(), rgb.len());
+    }
+
+    /// `RUSTYPANO_BENCH_TILES=<jpeg> cargo test --release tile_encode_speed -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn tile_encode_speed() {
+        let Ok(path) = std::env::var("RUSTYPANO_BENCH_TILES") else { return };
+        let mut reader = image::ImageReader::open(&path).unwrap();
+        reader.no_limits();
+        let img = reader.decode().unwrap().into_rgb8();
+        let (tw, th) = (736u32, 1088u32);
+        let tiles: Vec<Vec<u8>> = (0..12)
+            .map(|i| image::imageops::crop_imm(&img, 1000 + i * tw, 2000, tw, th).to_image().into_raw())
+            .collect();
+        let px = (tiles.len() as u32 * tw * th) as f64 / 1e6;
+        for (name, sampling) in [("4:4:4", jpeg_encoder::SamplingFactor::R_4_4_4), ("4:2:0", jpeg_encoder::SamplingFactor::R_4_2_0)] {
+            for q in [92u8, 85] {
+                let t = std::time::Instant::now();
+                let mut bytes = 0;
+                for rgb in &tiles {
+                    let mut out = Vec::new();
+                    let mut enc = jpeg_encoder::Encoder::new(&mut out, q);
+                    enc.set_sampling_factor(sampling);
+                    enc.encode(rgb, tw as u16, th as u16, jpeg_encoder::ColorType::Rgb).unwrap();
+                    bytes += out.len();
+                }
+                let s = t.elapsed().as_secs_f64();
+                println!("encode {name} q{q}: {:.0} MP/s single-threaded, {:.2} bytes/px", px / s, bytes as f64 / (px * 1e6));
+            }
+        }
+        let jpeg = encode_tile(&tiles[0], tw, th).unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..12 {
+            decode_tile(&jpeg).unwrap();
+        }
+        println!("decode tile: {:.0} MP/s", px / t.elapsed().as_secs_f64());
     }
 
     #[test]
