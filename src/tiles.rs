@@ -173,6 +173,28 @@ impl TileGrid {
         }
         n.max(pinned)
     }
+
+    /// Slots to hold every tile, or `None` if the GPU allows fewer texture
+    /// layers than that.
+    pub fn slots_for_all(&self, max_layers: u32) -> Option<u32> {
+        let mut n = self.tile_count();
+        if n == 1 || n.is_multiple_of(6) {
+            n += 1;
+        }
+        (n <= max_layers).then_some(n)
+    }
+
+    /// Every tile below the base level, coarse levels first.
+    fn all_tiles(&self) -> Vec<TileId> {
+        let base = self.base();
+        (0..base)
+            .rev()
+            .flat_map(|k| {
+                let l = self.levels[k];
+                (0..l.ny).flat_map(move |ty| (0..l.nx).map(move |tx| TileId { level: k as u8, tx: tx as u16, ty: ty as u16 }))
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +414,9 @@ pub struct TileCache {
     motion: Motion,
     /// Number of tiles at the start of `needed` that are visible right now.
     visible_count: usize,
+    /// Every tile is loaded and kept (the cache has a slot for each).
+    keep_all: bool,
+    all_tiles: Vec<TileId>,
     /// Frames drawn, and frames where a visible tile was still missing (so a
     /// coarser level was shown); logged when the panorama is closed.
     frames_drawn: u64,
@@ -424,6 +449,7 @@ impl TileCache {
         ctx: &eframe::egui::Context,
     ) -> Self {
         let grid = gpu.grid.clone();
+        let keep_all = gpu.slots >= grid.tile_count();
         let slots = gpu.slots as usize;
         let mut cache = Self {
             gpu: Arc::new(gpu),
@@ -442,6 +468,8 @@ impl TileCache {
             needed: Vec::new(),
             motion: Motion::default(),
             visible_count: 0,
+            keep_all: false,
+            all_tiles: Vec::new(),
             frames_drawn: 0,
             frames_missing: 0,
             #[cfg(not(target_arch = "wasm32"))]
@@ -459,6 +487,10 @@ impl TileCache {
             #[cfg(target_arch = "wasm32")]
             ctx: ctx.clone(),
         };
+        if keep_all {
+            cache.keep_all = true;
+            cache.all_tiles = grid.all_tiles();
+        }
         for (t, mips) in base {
             cache.install(t, &mips, queue);
         }
@@ -509,6 +541,18 @@ impl TileCache {
         self.resident.len() as u32
     }
 
+    /// Whether every tile is (or is being) kept on the GPU.
+    pub fn keeps_all(&self) -> bool {
+        self.keep_all
+    }
+
+    /// While all tiles are being loaded: (loaded, total).
+    pub fn preload_progress(&self) -> Option<(u32, u32)> {
+        let total = self.gpu.grid.tile_count();
+        let done = self.resident.len() as u32;
+        (self.keep_all && done < total).then_some((done, total))
+    }
+
     fn install(&mut self, t: TileId, mips: &[Vec<u8>], queue: &wgpu::Queue) {
         if self.resident.contains_key(&t) {
             return;
@@ -553,6 +597,11 @@ impl TileCache {
             let motion = if prefetch_enabled() { self.motion } else { Motion::default() };
             (self.needed, self.visible_count) =
                 plan_tiles(view, &motion, &self.gpu.grid, self.gpu.width, self.gpu.height, capacity);
+            if self.keep_all {
+                // Everything else too, after the visible and look-ahead tiles.
+                let mut seen: HashSet<TileId> = self.needed.iter().copied().collect();
+                self.needed.extend(self.all_tiles.iter().filter(|t| seen.insert(**t)).copied());
+            }
         }
         self.frames_drawn += 1;
         if self.needed[..self.visible_count].iter().any(|t| !self.resident.contains_key(t)) {
@@ -709,9 +758,11 @@ impl Drop for TileCache {
     fn drop(&mut self) {
         if self.frames_drawn > 0 {
             log::info!(
-                "{} of {} frames showed a visible tile at a coarser level",
+                "{} of {} frames showed a visible tile at a coarser level; {} of {} tiles were on the GPU",
                 self.frames_missing,
-                self.frames_drawn
+                self.frames_drawn,
+                self.resident.len(),
+                self.gpu.grid.tile_count()
             );
         }
     }
@@ -823,6 +874,17 @@ mod tests {
         let l0 = g.levels[0];
         let waste = (l0.nx * g.cx * l0.ny * g.cy) as f64 / (20000.0 * 10000.0) - 1.0;
         assert!(waste < 0.05, "waste {waste}");
+    }
+
+    #[test]
+    fn all_tiles_fit_when_keeping_everything() {
+        let g = TileGrid::new(20000, 10000);
+        let n = g.slots_for_all(2048).unwrap();
+        assert!(n >= g.tile_count() && n != 1 && !n.is_multiple_of(6));
+        assert_eq!(g.slots_for_all(100), None, "too many tiles for 100 layers");
+        let all = g.all_tiles();
+        assert_eq!(all.len() as u32, g.tile_count() - g.base_tiles());
+        assert!(all.windows(2).all(|w| w[0].level >= w[1].level), "coarse levels first");
     }
 
     #[test]

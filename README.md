@@ -168,7 +168,10 @@ GPU nor main memory has to hold the whole image:
   overlay is drawn analytically in the same pass.
 
 The GPU cache size is set under Settings → System (default 768 MB, 384 MB in the
-browser). Some OpenGL drivers fail silently when video memory runs out, so the
+browser). "Keep all tiles in GPU memory" (off by default) gives the cache a slot
+for every tile and loads them all in the background after opening, so viewing
+never waits for tiles; if the GPU has too few texture layers or too little
+memory, it falls back to loading on demand. Some OpenGL drivers fail silently when video memory runs out, so the
 cache is verified after allocation and made smaller if needed.
 
 ## Translations

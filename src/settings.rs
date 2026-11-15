@@ -94,6 +94,8 @@ pub struct Settings {
     pub max_gpu_memory_mb: u32,
     /// Size limit of the tile cache on disk / in the browser, in megabytes.
     pub tile_cache_mb: u32,
+    /// Load every tile into GPU memory, so viewing never waits for tiles.
+    pub keep_all_tiles_on_gpu: bool,
     pub mru: Vec<PathBuf>,
 }
 
@@ -121,6 +123,7 @@ impl Default for Settings {
             // bigger cache reloads less while panning. Browsers get less.
             max_gpu_memory_mb: if cfg!(target_arch = "wasm32") { 384 } else { 768 },
             tile_cache_mb: if cfg!(target_arch = "wasm32") { 4096 } else { 10240 },
+            keep_all_tiles_on_gpu: false,
             mru: Vec::new(),
         }
     }

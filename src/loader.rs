@@ -265,16 +265,29 @@ async fn load(
     let grid = TileGrid::new(width, height);
     let max_layers = device.limits().max_texture_array_layers;
     let mut budget = settings.max_gpu_memory_mb.max(64) as u64 * 1024 * 1024;
-    let mut slots = grid.slots_for_budget(budget, max_layers);
+    // "Keep all tiles": one slot per tile, if the GPU allows that many layers.
+    let mut keep_all = None;
+    if settings.keep_all_tiles_on_gpu {
+        keep_all = grid.slots_for_all(max_layers);
+        if keep_all.is_none() {
+            log::warn!("{} tiles exceed the GPU's {max_layers} texture layers, loading tiles on demand", grid.tile_count());
+        }
+    }
+    let mut slots = keep_all.unwrap_or_else(|| grid.slots_for_budget(budget, max_layers));
     let gpu = loop {
         let gpu = GpuTiles::allocate(device, grid.clone(), width, height, slots);
         if verify(&gpu, device, queue) {
             break gpu;
         }
         // Some drivers (notably OpenGL) fail texture allocation silently when
-        // out of video memory: the readback did not match, so use fewer slots.
-        budget /= 2;
-        let fewer = grid.slots_for_budget(budget, max_layers);
+        // out of video memory: the readback did not match, so use fewer slots
+        // (and give up keeping every tile).
+        let fewer = if keep_all.take().is_some() {
+            grid.slots_for_budget(budget, max_layers)
+        } else {
+            budget /= 2;
+            grid.slots_for_budget(budget, max_layers)
+        };
         log::warn!("GPU tile cache with {slots} slots failed verification (out of video memory?), trying {fewer}");
         gpu.texture.destroy();
         if fewer >= slots {

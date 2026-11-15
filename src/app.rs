@@ -1140,6 +1140,10 @@ impl RustyPanoApp {
                     let v = &p.view;
                     let l = &p.loaded;
                     ui.label(RichText::new(format!("{}×{}", l.width, l.height)).weak());
+                    if let Some((done, total)) = l.tiles.preload_progress() {
+                        ui.separator();
+                        ui.label(tr!("Loading tiles to the GPU: {done} / {total}", done = done, total = total));
+                    }
                     ui.separator();
                     ui.label(format!("{:.0}%", v.zoom_percent()));
                     ui.separator();
@@ -1215,6 +1219,9 @@ impl RustyPanoApp {
                             levels = g.grid.levels.len(),
                             secs = format!("{:.2}", l.load_time)
                         ));
+                        if l.tiles.keeps_all() {
+                            ui.label(tr!("All tiles are kept in GPU memory."));
+                        }
                         ui.label(if !l.tiles.is_persistent() {
                             tr!("Tiles are kept in memory (no tile cache available).")
                         } else if l.from_cache {
@@ -1381,6 +1388,17 @@ impl RustyPanoApp {
                         }
                         ui.label(RichText::new(note).weak());
                         ui.add_space(4.0);
+                        ui.checkbox(&mut draft.keep_all_tiles_on_gpu, tr!("Keep all tiles in GPU memory"));
+                        let need = self.pano.as_ref().map(|p| {
+                            let g = &p.loaded.tiles.gpu.grid;
+                            (g.tile_count() as u64 * g.slot_bytes()) >> 20
+                        });
+                        let mut note = tr!("No waiting for tiles while panning or zooming, but needs much more video memory; falls back to loading on demand if the GPU cannot hold them all.").to_string();
+                        if let Some(mb) = need {
+                            note = format!("{note} {}", tr!("The current panorama needs {mb} MB.", mb = mb));
+                        }
+                        ui.label(RichText::new(note).weak());
+                        ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             ui.label(tr!("GPU tile cache"));
                             ui.add(egui::DragValue::new(&mut draft.max_gpu_memory_mb).range(64..=4096).suffix(" MB").speed(16));
@@ -1424,7 +1442,8 @@ impl RustyPanoApp {
             let cm_changed = new.enable_color_management != self.settings.enable_color_management
                 || new.monitor_profile != self.settings.monitor_profile
                 || new.monitor_profile_file != self.settings.monitor_profile_file
-                || new.max_gpu_memory_mb != self.settings.max_gpu_memory_mb;
+                || new.max_gpu_memory_mb != self.settings.max_gpu_memory_mb
+                || new.keep_all_tiles_on_gpu != self.settings.keep_all_tiles_on_gpu;
             let mru = std::mem::take(&mut self.settings.mru);
             self.settings = new;
             self.settings.mru = mru;
