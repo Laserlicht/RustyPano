@@ -845,6 +845,109 @@ impl RustyPanoApp {
         });
     }
 
+    /// Overlay while files are dragged over the window.
+    fn drop_hint(&self, ctx: &egui::Context) {
+        // (name if known, MIME type if known)
+        let mut items: Vec<(Option<String>, String)> = ctx.input(|i| {
+            i.raw
+                .hovered_files
+                .iter()
+                .map(|f| (f.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()), f.mime.clone()))
+                .collect()
+        });
+        // Debug aid for screenshots: RUSTYPANO_DROP_HINT=a.jpg,b.fsv
+        if items.is_empty()
+            && let Ok(names) = std::env::var("RUSTYPANO_DROP_HINT")
+        {
+            items = names.split(',').map(|n| (Some(n.to_string()), String::new())).collect();
+        }
+        if items.is_empty() {
+            return;
+        }
+
+        let ext = |n: &str| n.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+        let known = |(name, mime): &(Option<String>, String)| -> Option<bool> {
+            match name {
+                Some(n) => Some(loader::is_supported_ext(&ext(n))),
+                None if mime.starts_with("image/") => Some(true),
+                None if !mime.is_empty() && mime != "application/octet-stream" => Some(false),
+                None => None, // browsers often reveal nothing while dragging
+            }
+        };
+        let states: Vec<Option<bool>> = items.iter().map(known).collect();
+        let unsupported = !states.is_empty() && states.iter().all(|s| *s == Some(false));
+        let tour = items.iter().any(|(n, _)| n.as_deref().is_some_and(|n| ext(n) == "fsv"));
+
+        let screen = ctx.content_rect();
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop-hint")));
+        painter.rect_filled(screen, 0.0, Color32::from_black_alpha(175));
+
+        let t = ctx.input(|i| i.time) as f32;
+        let pulse = 0.75 + 0.25 * (t * 3.0).sin();
+        let accent = if unsupported { Color32::from_rgb(235, 90, 80) } else { Color32::from_rgb(90, 160, 255) };
+        let stroke = Stroke::new(3.0, accent.gamma_multiply(pulse));
+        let frame = screen.shrink(24.0);
+        let c = [frame.left_top(), frame.right_top(), frame.right_bottom(), frame.left_bottom(), frame.left_top()];
+        painter.extend(egui::Shape::dashed_line(&c, stroke, 14.0, 10.0));
+
+        let title = if unsupported {
+            tr!("This file type cannot be opened")
+        } else if tour {
+            tr!("Drop to open the tour")
+        } else {
+            tr!("Drop to open the panorama")
+        };
+        let names: Vec<&str> = items.iter().filter_map(|(n, _)| n.as_deref()).collect();
+        let files = if names.is_empty() {
+            tr!("{n} file(s)", n = items.len())
+        } else if names.len() <= 3 {
+            names.join(", ")
+        } else {
+            format!("{}, {}", names[..3].join(", "), tr!("and {n} more", n = names.len() - 3))
+        };
+        let hint = if cfg!(target_arch = "wasm32") {
+            tr!("Drop a tour together with its images.")
+        } else {
+            tr!("JPEG, TIFF, PNG, WebP, BMP, JPEG XL or .fsv tour")
+        };
+        let title = painter.layout_no_wrap(title.into(), egui::FontId::proportional(26.0), Color32::WHITE);
+        let files = painter.layout_no_wrap(files, egui::FontId::proportional(16.0), Color32::from_gray(225));
+        let hint = painter.layout_no_wrap(hint.into(), egui::FontId::proportional(14.0), Color32::from_gray(165));
+
+        // Card behind icon and text, so the panorama does not compete with it.
+        let width = title.size().x.max(files.size().x).max(hint.size().x).min(screen.width() - 80.0) + 64.0;
+        let card = Rect::from_center_size(screen.center(), Vec2::new(width.max(320.0), 230.0));
+        painter.rect(card, 14.0, Color32::from_rgba_unmultiplied(28, 28, 32, 240), Stroke::new(1.0, accent.gamma_multiply(0.5)), egui::StrokeKind::Inside);
+
+        // Tray with an arrow pointing into it (a cross if unsupported).
+        let icon = card.center_top() + Vec2::new(0.0, 62.0);
+        let ink = Stroke::new(5.0, accent);
+        let tray = [
+            icon + Vec2::new(-34.0, 6.0),
+            icon + Vec2::new(-34.0, 30.0),
+            icon + Vec2::new(34.0, 30.0),
+            icon + Vec2::new(34.0, 6.0),
+        ];
+        painter.add(egui::Shape::line(tray.to_vec(), ink));
+        if unsupported {
+            painter.line_segment([icon + Vec2::new(-14.0, -30.0), icon + Vec2::new(14.0, -2.0)], ink);
+            painter.line_segment([icon + Vec2::new(14.0, -30.0), icon + Vec2::new(-14.0, -2.0)], ink);
+        } else {
+            let bob = 4.0 * (t * 3.0).sin();
+            let tip = icon + Vec2::new(0.0, 14.0 + bob);
+            painter.line_segment([icon + Vec2::new(0.0, -34.0 + bob), tip], ink);
+            painter.add(egui::Shape::line(vec![tip + Vec2::new(-13.0, -13.0), tip, tip + Vec2::new(13.0, -13.0)], ink));
+        }
+
+        let mut y = icon.y + 50.0;
+        for g in [title, files, hint] {
+            let h = g.size().y;
+            painter.galley(egui::pos2(card.center().x - g.size().x / 2.0, y), g, Color32::WHITE);
+            y += h + 8.0;
+        }
+        ctx.request_repaint();
+    }
+
     fn loading_overlay(&self, painter: &egui::Painter, rect: Rect) {
         let Some(job) = &self.job else { return };
         let p = job.progress.load(Ordering::Relaxed) as f32 / 1000.0;
@@ -1691,6 +1794,7 @@ impl eframe::App for RustyPanoApp {
         }
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewer(ui));
         self.dialogs(&ctx);
+        self.drop_hint(&ctx);
         self.debug_screenshot(&ctx);
     }
 

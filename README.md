@@ -82,7 +82,7 @@ TIFF, JPEG XL and BMP (read in stripes).
 | Full screen | `F11` (`Esc` leaves) |
 | Toggle hotspots / grid | `H` / `G` |
 | Reset to initial view | `Home` |
-| Open | `Ctrl+O`, or drop a file on the window |
+| Open | `Ctrl+O`, or drag files onto the window (an overlay shows what will open) |
 
 Mouse behaviour (Edit → Settings → Mouse): *Grab* (default, the image follows
 the pointer) or *Joystick* (speed grows with the distance from the click point,
@@ -201,7 +201,8 @@ Debug aids: `RUSTYPANO_SCREENSHOT=out.png` saves one rendered frame and quits
 `RUSTYPANO_NO_PREFETCH=1` turns look-ahead loading off; with `RUST_LOG=info`
 the app logs how many frames had to show a coarser level;
 `RUSTYPANO_GRID=1`, `RUSTYPANO_INTERP=nearest|bilinear|bicubic|lanczos` and
-`RUSTYPANO_DIALOG=options|metadata|hotspots|view|about` set up that frame.
+`RUSTYPANO_DIALOG=options|metadata|hotspots|view|about` and
+`RUSTYPANO_DROP_HINT=a.jpg,b.fsv` (drag-and-drop overlay) set up that frame.
 
 ## License
 
