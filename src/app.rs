@@ -100,6 +100,8 @@ pub struct RustyPanoApp {
     title: String,
 
     drag_origin: Option<Pos2>,
+    /// Momentum after a quick drag (grab mode).
+    inertia: crate::inertia::Inertia,
     last_motion: Instant,
     hovered_hotspot: Option<usize>,
     horizon_tool: bool,
@@ -160,6 +162,7 @@ impl RustyPanoApp {
             fullscreen: false,
             title: "RustyPano".into(),
             drag_origin: None,
+            inertia: Default::default(),
             last_motion: Instant::now(),
             hovered_hotspot: None,
             horizon_tool: false,
@@ -348,6 +351,7 @@ impl RustyPanoApp {
         }
         self.metadata = None;
         self.hotspot_list = None;
+        self.inertia.stop();
         self.pano = Some(Pano { loaded, view, hotspots, autospin });
     }
 
@@ -481,6 +485,9 @@ impl RustyPanoApp {
         if any > 0 && p.autospin != 0.0 {
             p.autospin = 0.0;
         }
+        if any > 0 {
+            self.inertia.stop();
+        }
         let v = &mut p.view;
         let mut moved = false;
         let pan = 1.2 * dt; // fraction of the FOV per second
@@ -610,12 +617,16 @@ impl RustyPanoApp {
         }
 
         // Panning.
+        let now = ctx.input(|i| i.time);
         if response.drag_started() {
             pano.autospin = 0.0;
             self.drag_origin = response.interact_pointer_pos();
+            self.inertia.start(now);
         }
-        if response.is_pointer_button_down_on() && !response.dragged() && pano.autospin != 0.0 {
+        if response.is_pointer_button_down_on() && !response.dragged() {
+            // Pressing the button (or a finger) catches a gliding view.
             pano.autospin = 0.0;
+            self.inertia.stop();
         }
         if response.dragged() {
             let v = &mut pano.view;
@@ -628,6 +639,7 @@ impl RustyPanoApp {
                         let vdegpp = v.vfov() / v.vh;
                         moved |= v.add_yaw(-dx * degpp);
                         moved |= v.add_pitch(dy * vdegpp);
+                        self.inertia.drag(now, [dx, dy]);
                     }
                 }
                 PanningMode::AutoPanning => {
@@ -650,6 +662,25 @@ impl RustyPanoApp {
         }
         if response.drag_stopped() {
             self.drag_origin = None;
+            if settings.smooth_panning && settings.panning_mode == PanningMode::ClickAndDrag {
+                self.inertia.release(now);
+            }
+        }
+        // Glide on after a quick drag.
+        if !response.dragged()
+            && let Some([dx, dy]) = self.inertia.step(now)
+        {
+            let v = &mut pano.view;
+            let (degpp, vdegpp) = (v.hfov / v.vw, v.vfov() / v.vh);
+            // Stop the part of the movement that hits a limit of the view.
+            if dx != 0.0 && !v.add_yaw(-dx * degpp) {
+                self.inertia.stop_axis(0);
+            }
+            if dy != 0.0 && !v.add_pitch(dy * vdegpp) {
+                self.inertia.stop_axis(1);
+            }
+            moved = true;
+            ctx.request_repaint();
         }
 
         // Auto spin / speed test.
@@ -1296,6 +1327,10 @@ impl RustyPanoApp {
                         ui.label(tr!("Mouse behaviour"));
                         ui.radio_value(&mut draft.panning_mode, PanningMode::ClickAndDrag, tr!("Grab: the image follows the pointer"));
                         ui.radio_value(&mut draft.panning_mode, PanningMode::AutoPanning, tr!("Joystick: speed grows with distance from the click"));
+                        ui.add_space(6.0);
+                        ui.add_enabled_ui(draft.panning_mode == PanningMode::ClickAndDrag, |ui| {
+                            ui.checkbox(&mut draft.smooth_panning, tr!("Smooth panning: the image glides on after a quick drag"));
+                        });
                         ui.add_space(6.0);
                         ui.add_enabled_ui(draft.panning_mode == PanningMode::AutoPanning, |ui| {
                             ui.horizontal(|ui| {

@@ -150,6 +150,7 @@
 "Save the current yaw, pitch and field of view as the view shown when the file is opened" = "Aktuellen Schwenk, Neigung und Sichtfeld als Ansicht beim Öffnen der Datei speichern"
 "Settings" = "Einstellungen"
 "Settings…" = "Einstellungen…"
+"Smooth panning: the image glides on after a quick drag" = "Sanftes Verschieben: das Bild gleitet nach schnellem Ziehen weiter"
 "sRGB (assumed)" = "sRGB (angenommen)"
 "Standard sRGB display" = "Standard-sRGB-Bildschirm"
 "Start field of view" = "Start-Sichtfeld"

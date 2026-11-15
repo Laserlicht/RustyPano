@@ -86,7 +86,9 @@ for baseline JPEG, PNG, TIFF, JPEG XL and BMP (read in stripes).
 
 Mouse behaviour (Edit → Settings → Mouse): *Grab* (default, the image follows
 the pointer) or *Joystick* (speed grows with the distance from the click point,
-with adjustable speed).
+with adjustable speed). In grab mode, *smooth panning* (on by default) lets the
+image glide on after a quick drag and slow down, as in map applications; a click
+or key press stops it.
 
 ## Features
 

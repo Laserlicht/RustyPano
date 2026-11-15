@@ -81,6 +81,8 @@ pub struct Settings {
     pub panning_mode: PanningMode,
     /// 1..10, higher = faster auto-panning.
     pub mouse_sensitivity: f64,
+    /// Grab panning: the view glides on after a quick drag.
+    pub smooth_panning: bool,
     pub interpolator_steady: Interpolator,
     pub interpolator_panning: Interpolator,
     pub enable_color_management: bool,
@@ -110,6 +112,7 @@ impl Default for Settings {
             show_hotspot_tooltips: true,
             panning_mode: PanningMode::ClickAndDrag,
             mouse_sensitivity: 5.0,
+            smooth_panning: true,
             interpolator_steady: Interpolator::Lanczos3,
             interpolator_panning: Interpolator::Bilinear,
             enable_color_management: true,

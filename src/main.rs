@@ -6,6 +6,7 @@
 
 #[macro_use]
 mod i18n;
+mod inertia;
 
 mod app;
 mod fsv;
