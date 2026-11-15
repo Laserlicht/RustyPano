@@ -276,7 +276,7 @@ async fn load(
     let mut slots = keep_all.unwrap_or_else(|| grid.slots_for_budget(budget, max_layers));
     let gpu = loop {
         let gpu = GpuTiles::allocate(device, grid.clone(), width, height, slots);
-        if verify(&gpu, device, queue) {
+        if verify(&gpu, device, queue).await {
             break gpu;
         }
         // Some drivers (notably OpenGL) fail texture allocation silently when
@@ -658,16 +658,10 @@ async fn store_tiles(store: &TileStore, tiles: Vec<(TileId, Vec<u8>)>, grid: &Ti
     Ok(bytes)
 }
 
-/// The browser cannot wait for a GPU readback; WebGPU reports allocation
-/// failures itself, so the check is skipped there.
-#[cfg(target_arch = "wasm32")]
-fn verify(_: &GpuTiles, _: &wgpu::Device, _: &wgpu::Queue) -> bool {
-    true
-}
-
-/// Write a texel into the last cache slot and read it back.
-#[cfg(not(target_arch = "wasm32"))]
-fn verify(gpu: &GpuTiles, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
+/// Write a texel into the last cache slot and read it back. Some drivers
+/// (OpenGL, WebGL) fail to allocate a too large texture silently and then
+/// draw nothing but black.
+async fn verify(gpu: &GpuTiles, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
     let probe = [11u8, 222, 33, 255];
     let layer = gpu.slots - 1;
     let at = wgpu::TexelCopyTextureInfo {
@@ -695,12 +689,25 @@ fn verify(gpu: &GpuTiles, device: &wgpu::Device, queue: &wgpu::Queue) -> bool {
     );
     queue.submit([enc.finish()]);
     let slice = buf.slice(..);
-    let (tx, rx) = mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r.is_ok());
-    });
+    let result: Arc<Mutex<Option<bool>>> = Arc::default();
+    let r = result.clone();
+    slice.map_async(wgpu::MapMode::Read, move |ok| *r.lock().unwrap() = Some(ok.is_ok()));
+    // Natively wait for the GPU; the browser cannot block, so poll and let
+    // it run in between.
+    #[cfg(not(target_arch = "wasm32"))]
     let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(30)) });
-    if !rx.recv().unwrap_or(false) {
+    let t0 = Instant::now();
+    let mapped = loop {
+        if let Some(ok) = *result.lock().unwrap() {
+            break ok;
+        }
+        if t0.elapsed().as_secs() >= 30 {
+            break false;
+        }
+        let _ = device.poll(wgpu::PollType::Poll);
+        yield_now().await;
+    };
+    if !mapped {
         return false;
     }
     let Ok(data) = slice.get_mapped_range() else { return false };
