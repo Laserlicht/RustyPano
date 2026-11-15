@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=RustyPano
+GenericName=Panorama Viewer
+GenericName[de]=Panoramabetrachter
+Comment=GPU-accelerated viewer for equirectangular panoramas
+Comment[de]=GPU-beschleunigter Betrachter für equirektangulare Panoramen
+Exec=rustypano %f
+Icon=rustypano
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/jpeg;image/tiff;image/png;image/webp;image/bmp;image/jxl;
+Keywords=panorama;360;equirectangular;photosphere;

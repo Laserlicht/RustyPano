@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 RustyPano contributors
 
+// Release builds on Windows are GUI apps: no console window.
+#![cfg_attr(all(windows, not(debug_assertions), not(test)), windows_subsystem = "windows")]
+
 #[macro_use]
 mod i18n;
 

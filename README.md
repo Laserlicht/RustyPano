@@ -5,6 +5,21 @@ A GPU-accelerated viewer for equirectangular panoramas, written in Rust with
 `eframe`). Supports `.fsv` panorama tour files with hotspots, GPano XMP
 metadata, partial panoramas, a grid overlay and colour management.
 
+## Downloads
+
+Every push to `main` is built by GitHub Actions (`.github/workflows/build.yml`) for:
+
+| Platform | Package |
+|---|---|
+| Linux x64 / ARM64 | `RustyPano-<version>-linux-<arch>.AppImage` (glibc 2.35+) |
+| Windows x64 / ARM64 | `RustyPano-<version>-windows-<arch>.zip` |
+| macOS ARM64 (11+) | `RustyPano-<version>-macos-arm64.zip` (contains `RustyPano.app`) |
+
+The packages are attached to each workflow run as artifacts, and to a GitHub
+release when a `v*` tag is pushed. The macOS app is only ad-hoc signed, not
+notarized: after unzipping, run `xattr -dr com.apple.quarantine RustyPano.app`
+or right-click → Open the first time.
+
 ## Build & run
 
 ```sh
@@ -104,6 +119,7 @@ catalog file.
 | `src/xmp.rs` | GPano XMP read (JPEG/TIFF/PNG) and write (JPEG) |
 | `src/settings.rs` | persisted preferences |
 | `src/i18n.rs`, `i18n/de.toml` | translations and language detection |
+| `build.rs`, `packaging/`, `.github/workflows/` | Windows icon, AppImage/macOS packaging, CI |
 
 Debug aids: `RUSTYPANO_SCREENSHOT=out.png` saves one rendered frame and quits;
 `RUSTYPANO_GRID=1`, `RUSTYPANO_INTERP=nearest|bilinear|bicubic|lanczos` and

@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 RustyPano contributors
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Oldest macOS the app bundle supports (matches LSMinimumSystemVersion).
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run on Ubuntu 22.04 so the AppImages work on
+          # distributions with glibc 2.35 or newer.
+          - name: Linux x64 (AppImage)
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            package: appimage
+            arch: x86_64
+          - name: Linux ARM64 (AppImage)
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            package: appimage
+            arch: aarch64
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            package: windows
+            arch: x64
+          - name: Windows ARM64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            package: windows
+            arch: arm64
+          - name: macOS ARM64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            package: macos
+            arch: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev \
+            libxrandr-dev libxi-dev libgl1-mesa-dev file
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: cargo test --release --locked --target ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package AppImage
+        if: matrix.package == 'appimage'
+        run: packaging/linux/build-appimage.sh ${{ matrix.target }} dist
+
+      - name: Package Windows zip
+        if: matrix.package == 'windows'
+        shell: pwsh
+        run: |
+          $name = "RustyPano-${{ steps.version.outputs.version }}-windows-${{ matrix.arch }}"
+          $stage = Join-Path "build" $name
+          New-Item -ItemType Directory -Force -Path $stage, dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/rustypano.exe" $stage
+          Copy-Item LICENSE, README.md $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip"
+
+      - name: Package macOS app
+        if: matrix.package == 'macos'
+        run: |
+          app="build/RustyPano.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" dist
+          cp "target/${{ matrix.target }}/release/rustypano" "$app/Contents/MacOS/"
+          cp assets/rustypano.icns "$app/Contents/Resources/"
+          sed "s/@VERSION@/${{ steps.version.outputs.version }}/g" packaging/macos/Info.plist \
+            > "$app/Contents/Info.plist"
+          # Ad-hoc signature; the app is not notarized.
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --keepParent "$app" \
+            "dist/RustyPano-${{ steps.version.outputs.version }}-macos-${{ matrix.arch }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RustyPano-${{ matrix.package }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
